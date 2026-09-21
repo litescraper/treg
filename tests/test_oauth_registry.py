@@ -7,6 +7,7 @@ only the scopes the chosen capability actually needs.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -136,6 +137,56 @@ def test_multi_method_provider_is_configured_when_any_method_is_available(monkey
         get_settings.cache_clear()
 
 
+@pytest.mark.parametrize(
+    (
+        "pending", "default_capability", "page_capabilities", "page_default",
+        "direct_warning", "page_warning",
+    ),
+    [
+        (
+            "instagram-login,page-messages", "page-tools",
+            ["page-tools", "page-messages"], "page-tools", True, True,
+        ),
+        ("instagram-login", "page-messages", ["page-messages"], "page-messages", True, False),
+        ("", "manage", ["page-messages"], "page-messages", False, False),
+    ],
+)
+def test_one_review_setting_controls_the_instagram_connect_experience(
+    monkeypatch, pending, default_capability, page_capabilities, page_default,
+    direct_warning, page_warning,
+):
+    from treg import oauth_providers as P
+
+    monkeypatch.setenv("TREG_OAUTH_REVIEW_PENDING", pending)
+    get_settings.cache_clear()
+    try:
+        row = next(item for item in P.listing() if item["service"] == "instagram")
+        methods = {item["name"]: item for item in row["authorization_methods"]}
+        direct = methods["instagram-login"]
+        page = methods["facebook-page"]
+
+        assert row["connect_default_capability"] == default_capability
+        assert row["permission_capabilities"] == (
+            ["manage", "page-messages", "page-tools", "post", "read"]
+            if page_warning else ["manage", "page-messages", "post", "read"]
+        )
+        assert page["capabilities"] == page_capabilities
+        assert page["connect_capability"] == page_default
+        assert direct["in_review"] is direct_warning
+        assert page["capabilities_in_review"] == (["page-messages"] if page_warning else [])
+        assert ("review is not complete" in direct["description"]) is direct_warning
+        assert ("still reviewing" in page["description"]) is page_warning
+        assert (
+            "review is still in progress" in page["capability_help"]["page-messages"]
+        ) is page_warning
+        assert page["capability_labels"]["page-messages"] == (
+            "Facebook Page tools + messages" if page_warning else "Facebook Page tools"
+        )
+        assert len(page["capability_details"]["page-messages"]) == (1 if page_warning else 6)
+    finally:
+        get_settings.cache_clear()
+
+
 async def test_unknown_capability_is_422(clients: AsyncClient, treg_google_app):
     r = await clients.post(
         "/oauth/start", json={"provider": "google-search-console", "capability": "nope"}
@@ -213,6 +264,9 @@ def test_meta_providers_disclose_the_crewlet_app_name():
     assert "separate from Instagram Login" in page["description"]
     assert "Facebook Page authorization" in page["missing_message"]
     assert "Adds these Page-only tools" in page["capability_intros"]["page-tools"]
+    assert page["capability_labels"]["page-tools"] == "Facebook Page tools"
+    assert page["capability_labels"]["page-messages"] == "Facebook Page tools + messages"
+    assert "review is still in progress" in page["capability_help"]["page-messages"]
     assert page["capability_details"]["page-tools"] == [
         "Search hashtags and read recent or top hashtag media",
         "Discover another professional account by username",
@@ -248,3 +302,31 @@ def test_a_notice_provider_always_reaches_a_pre_consent_modal():
             )
         else:
             assert len(p.capabilities) >= 2, p.service
+
+
+def test_catalog_targets_are_exact_provider_approved_https_roots():
+    from treg import oauth_providers as P
+
+    extract = P.DIFFBOT.profile_for_catalog_host("api.diffbot.com")
+    assert extract.base_url == "https://api.diffbot.com"
+    assert extract.token_location == "query" and extract.token_param == "token"
+
+    search = P.DIFFBOT.profile_for_catalog_host("llm.diffbot.com")
+    assert search.base_url == "https://llm.diffbot.com"
+    assert search.token_location == "header"
+    assert search.token_header == "Authorization" and search.token_format == "Bearer {secret}"
+
+    natural_language = P.DIFFBOT.profile_for_catalog_host("nl.diffbot.com")
+    assert natural_language.base_url == "https://nl.diffbot.com"
+    assert natural_language.token_location == "query" and natural_language.token_param == "token"
+
+    unsafe = replace(
+        P.DIFFBOT,
+        catalog_targets=(P.CatalogTarget(
+            host="api.diffbot.com", base_url="https://credentials.example/v3",
+        ),),
+    )
+    with pytest.raises(ValueError, match="safe HTTPS base URL"):
+        unsafe.profile_for_catalog_host("api.diffbot.com")
+    with pytest.raises(ValueError, match="not uniquely approved"):
+        P.DIFFBOT.profile_for_catalog_host("credentials.example")

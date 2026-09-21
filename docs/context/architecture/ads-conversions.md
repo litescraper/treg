@@ -5,6 +5,7 @@ sources:
   - src/treg/adsconv.py
   - src/treg/application/signup.py
   - src/treg/web/adtrack.js
+  - src/treg/web/gtag.js
 related:
   - architecture/money.md
   - architecture/multi-tenancy.md
@@ -30,14 +31,25 @@ read-side Ads catalog calls (`oauth_providers.GOOGLE_ADS`), a separate credentia
 
 ## The chain: capture → store → fire → upload
 
-1. **Capture** (`web/adtrack.js`, a first-party script, no Google tag). It reads `gclid`/`gbraid`/
+1. **Capture** (`web/adtrack.js`, a first-party script). It reads `gclid`/`gbraid`/
    `wbraid` off the URL — `gbraid`/`wbraid` are what Google substitutes on iOS traffic, and omitting
    them silently drops a large share of mobile conversions — and writes them into a `treg_ad` cookie
    (90 days, the length of Google's click-through attribution window; `SameSite=Lax` so it survives
-   the cross-site top-level navigation an ad click is). No third-party request is made from the
-   browser at any point. The cookie records the mutually-exclusive field name as well as its value
-   (`gclid|…`, `gbraid|…`, or `wbraid|…`); the old `CLICK_ID|landing` shape remains readable as a
-   legacy GCLID.
+   the cross-site top-level navigation an ad click is). The cookie records the mutually-exclusive
+   field name as well as its value (`gclid|…`, `gbraid|…`, or `wbraid|…`); the old `CLICK_ID|landing`
+   shape remains readable as a legacy GCLID. Marketing pages (landing, use-case pages, resources,
+   tutorial, catalog) also load `web/gtag.js`, which sends pageviews to Google Ads for attribution
+   modeling — this is the only browser-side Google request. The signed-in dashboard does not load
+   gtag.js.
+   Which pages load `adtrack.js` is the whole feature's blast radius and it has been wrong twice —
+   once for everything off `_page()` (2026-08-30), once for the standalone landing pages
+   `/people-search`, `/grokbot` and `/fable` (2026-09-06, after 4,892 Demand Gen clicks landed on
+   the first of them). Both escapes were the same shape: a guard that only covered the pages
+   someone had listed. `tests/test_adsconv.py` now holds two — the named ad destinations in
+   `test_every_public_landing_surface_loads_the_capture_script`, and
+   `test_every_public_html_route_carries_the_capture_script`, which sweeps every flat GET route and
+   requires the tag on anything answering `200 text/html`, so a new page is in scope the moment its
+   route exists. See `interface/seo.md` for the page-by-page scope.
 2. **Store** (`application.signup._ad_attribution_from`, read at both signup doors: `register_user` (`POST /users`)
    and `create_org` (`POST /orgs`), since a browser visitor who clicked an ad can land on either).
    The cookie is decoded and persisted onto the new `Org`: `ad_gclid` (the historical column name,
@@ -131,7 +143,9 @@ touches balance.
 ## Atomicity: two of three fire sites are atomic with their event, one is not
 
 - **`signup`** — atomic. `adsconv.queue()` and `ledger.grant()` both stage in `_grant_signup_promo`,
-  and its one commit lands both rows together.
+  and its one commit lands the user claim and credit together with the conversion when eligible.
+  Conversions remain per-team even when a user is unverified, already claimed, legacy-ineligible,
+  or the grant amount is zero; a conversion is not evidence of credited money.
 - **`first_call`** — atomic. `_record_first_call` queues the conversion and commits once, on its own
   session.
 - **`paid`** — **not atomic**. `billing._credit` commits the credit first, then queues the `paid`

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from ..infra import db as database
 from ..config import get_settings
 from ..domain.identity import session as sess
 from ..domain.identity import mcp_oauth
+from ..domain.identity import api_keys as managed_keys
 from ..domain.identity.access import (
     _is_machine_email,
     _membership_by_token,
@@ -41,7 +44,6 @@ from ..timeutil import utcnow_naive as _utcnow_naive
 from . import signup
 
 
-CLI_TOKEN_TTL = 30 * 24 * 3600      # identity token lifetime for the CLI
 EMAIL_CODE_TTL = 10 * 60  # seconds a code stays valid
 MAX_OTP_ATTEMPTS = 5  # invalidate a code after this many wrong guesses (brute-force guard)
 OTP_NS = "otp"
@@ -54,7 +56,7 @@ AUTH_CODE_TTL_S = 300   # a code is redeemed within seconds; five minutes is gen
 
 # In-memory handshake state for `treg login` (single-instance; short-lived, fine to lose on restart).
 # Both carry a created-at so abandoned handshakes (unauthenticated, attacker-chosen keys) are swept
-# rather than accumulating forever — the results map holds live 30-day tokens, so it must not leak.
+# rather than accumulating forever — the results map holds live identity tokens, so it must not leak.
 _cli_states: dict[str, tuple[str, datetime]] = {}   # oauth state -> (login_id, created_at)
 _cli_results: dict[str, tuple[dict, datetime]] = {}  # login_id -> (result, created_at) — a completed login
 # login_id -> (pairing_code, attempts_left, created_at). Created by POST /auth/cli/start; the browser must
@@ -208,6 +210,8 @@ async def start_email_login(email: str, client_ip: str) -> dict:
         raise EmailAuthError("demo_address")
     if _is_machine_email(email):
         raise EmailAuthError("machine_identity")
+    if signup.blocked_email(email, "otp_start"):  # refuse early: no code, no mail, no rate window
+        raise EmailAuthError("blocked_domain")
 
     async with database.session_maker() as db:
         await ratestore.sweep(db, OTP_START_NS)
@@ -234,7 +238,7 @@ async def start_email_login(email: str, client_ip: str) -> dict:
     return result
 
 
-async def verify_email_login(email: str, code: str) -> VerifiedEmail:
+async def verify_email_login(email: str, code: str, *, entry_surface: str = "") -> VerifiedEmail:
     """Consume an email OTP and return both CLI and browser credentials for the proven identity."""
     email = _norm_email(email)
     async with database.session_maker() as db:
@@ -251,15 +255,22 @@ async def verify_email_login(email: str, code: str) -> VerifiedEmail:
             await db.commit()
             raise EmailAuthError("invalid_code")
         await ratestore.kv_pop(db, OTP_NS, email)
+        created: set[int] = set()
         try:
-            user = await signup.find_or_create_user(db, email)
+            user = await signup.find_or_create_user(db, email, door="otp_verify", created=created, verified=True)
         except signup.MachineIdentityError as exc:
             raise EmailAuthError("machine_identity") from exc
+        except signup.BlockedEmailError as exc:  # a code minted before the domain was listed
+            raise EmailAuthError("blocked_domain") from exc
         if user.suspended:
             raise EmailAuthError("suspended")
         await db.commit()
-        token = sess.make(user.id, CLI_TOKEN_TTL, user.token_version)
-        session_cookie = sess.make(user.id, token_version=user.token_version)
+        signup.track_signup(user, created, "email", entry_surface)
+        token = sess.make_identity(
+            user.id, user.token_version, ttl=sess.BOOTSTRAP_TTL_SECONDS,
+            scope=sess.BOOTSTRAP_SCOPE,
+        )
+        session_cookie = sess.make_session(user.id, token_version=user.token_version)
         return VerifiedEmail(token=token, email=user.email, session_cookie=session_cookie)
 
 
@@ -339,6 +350,7 @@ async def approve_cli_login(
             _cli_pending[login_id] = (expected, tries_left - 1, started_at)
             raise CliPairingError("wrong_code")
         active_org: str | None = None
+        default = None
         if requested_org:
             org = await _resolve_org(requested_org, db)
             membership = (await db.execute(select(Membership).where(
@@ -348,8 +360,15 @@ async def approve_cli_login(
             if org is None or membership is None:
                 raise CliPairingError("not_member")
             active_org = org.slug
+            default = await managed_keys.ensure_default_key(db, membership, user)
+            await db.commit()
         _cli_pending.pop(login_id, None)  # code matched, so consume the pending login before publishing
-        result = {"token": sess.make(user.id, CLI_TOKEN_TTL, user.token_version), "email": user.email}
+        result = {"token": sess.make_identity(
+            user.id, user.token_version, org=active_org,
+            ttl=None if active_org else sess.BOOTSTRAP_TTL_SECONDS,
+            key_generation=default.default_generation if default else None,
+            scope=sess.TEAM_SCOPE if active_org else sess.BOOTSTRAP_SCOPE,
+        ), "email": user.email}
         if active_org:
             result["active_org"] = active_org
         _cli_results[login_id] = (result, _utcnow_naive())
@@ -376,10 +395,26 @@ async def issue_cli_token(
                 ))).scalar_one_or_none()
                 if membership is not None:
                     org_slug = org.slug
+                    user = await db.get(User, user_id)
+                    default = await managed_keys.ensure_default_key(db, membership, user) if user else None
+                    await db.commit()
+                else:
+                    default = None
+            else:
+                default = None
+        else:
+            default = None
         return {
-            "token": sess.make(user_id, CLI_TOKEN_TTL, token_version, org=org_slug),
+            "token": sess.make_identity(
+                user_id, token_version, org=org_slug,
+                ttl=None if org_slug else sess.BOOTSTRAP_TTL_SECONDS,
+                key_generation=default.default_generation if default else None,
+                scope=sess.TEAM_SCOPE if org_slug else sess.BOOTSTRAP_SCOPE,
+            ),
             "email": email,
             "org": org_slug,
+            "default_key_id": default.id if default else None,
+            "default_key_state": default.state if default else None,
         }
 
 
@@ -391,9 +426,12 @@ async def revoke_identity_tokens(user_id: int) -> RevokedIdentityTokens:
         user.token_version += 1
         await db.commit()
         return RevokedIdentityTokens(
-            token=sess.make(user.id, CLI_TOKEN_TTL, user.token_version),
+            token=sess.make_identity(
+                user.id, user.token_version, ttl=sess.BOOTSTRAP_TTL_SECONDS,
+                scope=sess.BOOTSTRAP_SCOPE,
+            ),
             email=user.email,
-            session_cookie=sess.make(user.id, token_version=user.token_version),
+            session_cookie=sess.make_session(user.id, token_version=user.token_version),
         )
 
 
@@ -426,22 +464,28 @@ def start_google_login(cli: str, callback_base: Callable[[], str]) -> SocialLogi
     return SocialLoginStart(state=state, url=url)
 
 
-async def _provision_social_user(email: str, state: str) -> SocialLoginProof:
+async def _provision_social_user(email: str, state: str, door: str, entry_surface: str = "") -> SocialLoginProof:
+    created: set[int] = set()
     async with database.session_maker() as db:
         try:
-            user = await signup.find_or_create_user(db, email)  # first login = registration (user only; no auto org)
+            user = await signup.find_or_create_user(
+                db, email, door=door, created=created, verified=True,
+            )  # first login creates only the user
         except signup.MachineIdentityError as exc:
             raise SocialLoginError("machine_identity") from exc
+        except signup.BlockedEmailError as exc:  # a Google/GitHub account on a listed domain
+            raise SocialLoginError("blocked_domain") from exc
         if user.suspended:  # a banned account may prove its email but must not receive a live session
             raise SocialLoginError("suspended")
         await db.commit()
+        signup.track_signup(user, created, door, entry_surface)
         # Browser session OR `treg login` handshake — both go through the /login team picker now.
         return SocialLoginProof(user=user, cli_state=_cli_states.pop(state, None))
 
 
 async def complete_github_login(
     client_factory: Callable[[], Any], code: str, state: str, cookie_state: str,
-    callback_base: Callable[[], str],
+    callback_base: Callable[[], str], *, entry_surface: str = "",
 ) -> SocialLoginProof:
     if not code or not state or state != cookie_state:
         raise SocialLoginError("bad_state")
@@ -471,12 +515,12 @@ async def complete_github_login(
     except Exception as exc:  # noqa: BLE001
         print(f"[auth] github callback error: {exc}")  # keep internals server-side, not in the response
         raise SocialLoginError("callback_failed") from exc
-    return await _provision_social_user(email, state)
+    return await _provision_social_user(email, state, "github", entry_surface)
 
 
 async def complete_google_login(
     client_factory: Callable[[], Any], code: str, state: str, cookie_state: str,
-    callback_base: Callable[[], str],
+    callback_base: Callable[[], str], *, entry_surface: str = "",
 ) -> SocialLoginProof:
     if not code or not state or state != cookie_state:
         raise SocialLoginError("bad_state")
@@ -508,7 +552,7 @@ async def complete_google_login(
     except Exception as exc:  # noqa: BLE001
         print(f"[auth] google callback error: {exc}")  # keep internals server-side, not in the response
         raise SocialLoginError("callback_failed") from exc
-    return await _provision_social_user(email, state)
+    return await _provision_social_user(email, state, "google", entry_surface)
 
 
 async def current_identity(x_treg_token: str, session_cookie: str) -> CurrentIdentity:
@@ -520,6 +564,27 @@ async def current_identity(x_treg_token: str, session_cookie: str) -> CurrentIde
                     else await _user_from_identity_token(x_treg_token, db))
             if user is not None and user.suspended:
                 user = None
+            # A team-pinned signed identity credential is the membership's default key. `/auth/me`
+            # is also the CLI's login verifier, so it must enforce the same team-local disable and
+            # revoke state as `require_member`. Short-lived typed MCP OAuth bridge tokens stay on
+            # their separate audience path.
+            claims = sess.read_identity_claims(x_treg_token)
+            oauth_bridge = bool(
+                claims and claims.get("aud") == sess.IDENTITY_AUDIENCE
+                and claims.get("exp") is not None
+            )
+            if membership is None and user is not None and claims and claims.get("org") and not oauth_bridge:
+                org = await _resolve_org(claims["org"], db)
+                if org is not None:
+                    membership = (await db.execute(select(Membership).where(
+                        Membership.user_id == user.id, Membership.org_id == org.id,
+                    ))).scalar_one_or_none()
+                    if membership is not None:
+                        key = await managed_keys.ensure_default_key(db, membership, user)
+                        if key is not None and key.state != managed_keys.ACTIVE:
+                            raise IdentityLookupError
+                        await db.commit()
+                        managed_keys.touch(key)
         else:
             user = await _user_from_session(session_cookie, db)
         if user is None:
@@ -574,7 +639,7 @@ async def invite_signin_landing(
                 raise InviteSigninError("expired")
             org = await db.get(Org, invite.org_id)
             switch_email = None
-            uid = sess.read(session_cookie)
+            uid = sess.read_session(session_cookie)
             if uid is not None:
                 current = await db.get(User, uid)
                 if current is not None and current.email != invite.email:
@@ -601,9 +666,13 @@ async def confirm_invite_signin(email_token: str) -> InviteSigninProof:
         if invite is None:  # consumed / expired / revoked / suspended org → the SPA's expired banner
             raise InviteSigninError("expired")
         try:
-            user = await signup.find_or_create_user(db, invite.email)  # first click = registration (user only, no auto org)
+            user = await signup.find_or_create_user(
+                db, invite.email, door="invite_link", verified=True,
+            )  # only the inbox-only link proves the email
         except signup.MachineIdentityError as exc:
             raise InviteSigninError("machine_identity") from exc
+        except signup.BlockedEmailError as exc:  # an invite to a listed domain must not become a session
+            raise InviteSigninError("blocked_domain") from exc
         if user is None or user.suspended:  # a banned account may hold the link but must not get a session
             raise InviteSigninError("suspended")
         invite.email_token_hash = None  # consume: one sign-in per emailed link
@@ -618,7 +687,7 @@ async def confirm_invite_signin(email_token: str) -> InviteSigninProof:
         )
         return InviteSigninProof(
             destination=destination,
-            session_cookie=sess.make(user.id, token_version=user.token_version),
+            session_cookie=sess.make_session(user.id, token_version=user.token_version),
         )
 
 
@@ -872,9 +941,13 @@ async def _refresh_grant(*, refresh_token: str, client_id: str, resource: str) -
             # cost of being wrong is one sign-in; the cost of the other mistake is somebody's balance.
             killed = await _revoke_refresh_family(row.family_id, "reuse detected", db)
             await db.commit()
+            # `CallRecord` has no column for the family or the kill count; audit drops unknown
+            # telemetry keys with a warning on every occurrence, so they go to the log instead.
+            logging.getLogger("treg.auth").warning(
+                "refresh token reuse: family %s revoked (%s grants)", row.family_id, killed)
             audit.record_call(org_id=row.org_id, user_email="", tool_name="oauth.refresh_reuse",
                               method="POST", path="/oauth/token", status_code=400, client="",
-                              telemetry={"family": row.family_id, "revoked": killed})
+                              refused_by="auth")
             raise OAuthServerError(
                 "invalid_grant",
                 "this refresh token was already used — the grant has been revoked, sign in again",

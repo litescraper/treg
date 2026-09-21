@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, PositiveInt, field_validator
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Every hostname the reference deployment has EVER answered to. treg moved
+# Every hostname the hosted service has answered to. treg moved
 # treg.superdesign.dev → treg.to (2026-08); installed CLIs, skill.md files, .mcp.json configs and
 # MCP OAuth grants exist against BOTH names, so both stay valid everywhere a host or audience is
-# recognized — mcp.py's transport allow-lists, mcp_oauth's token audiences, api.py's login-callback
-# anchoring — REGARDLESS of which one `public_url` currently points at. That symmetry is what makes
+# recognized by mcp.py's transport allow-lists, mcp_oauth's token audiences and api.py's login callback,
+# regardless of which one `public_url` currently points at. That symmetry is what makes
 # a TREG_PUBLIC_URL revert a complete rollback: grants and logins minted on either name survive the
 # flip in either direction. Self-hosters are unaffected: these only ADD accepted names, and none of
 # them resolve to a self-hosted deployment.
@@ -31,8 +32,28 @@ def platform_setting_name(provider: str) -> str:
     return "platform_key_" + (provider or "").lower().replace("-", "_")
 
 
+@lru_cache
+def _blocked_email_domains(raw: str) -> frozenset[str]:
+    """Parse `TREG_BLOCKED_EMAIL_DOMAINS` once per distinct value, not per request: split on commas,
+    trim, drop a leading `@` or `.` (operators paste both spellings), lowercase, drop empties. A
+    dotless entry (`com`) is dropped too: the classifier walks parent domains, so a bare public
+    suffix would refuse every address on earth from one typo in a dashboard field."""
+    return frozenset(
+        d for d in (part.strip().lstrip("@.").rstrip(".").lower() for part in raw.split(","))
+        if "." in d
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="TREG_", extra="ignore")
+
+    review_sample_rate: float = Field(default=0, ge=0, le=1)
+    feedback_hint_rate: float = Field(default=0, ge=0, le=1)
+    # Review invitations a team can receive per hour, whatever its call volume. Sampling decides
+    # WHICH calls qualify; this decides how many of them a team is actually asked about.
+    review_budget_per_hour: int = Field(default=5, ge=1)
+    # The shared key-value store (Redis protocol). Empty = an in-process fallback; see infra/kv.py.
+    kv_url: str = ""
 
     # SQLite locally, Postgres on Render — same code path, just swap the URL.
     database_url: str = "sqlite+aiosqlite:///./treg.db"
@@ -40,14 +61,20 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def _async_pg_driver(cls, v: str) -> str:
-        # Render's `fromDatabase` (render.yaml) injects a bare `postgres://`/`postgresql://` URL, but
+        # Some hosts inject a bare `postgres://`/`postgresql://` URL, but
         # our async engine (create_async_engine) needs the asyncpg driver. Rewrite the scheme so the
-        # Blueprint can auto-wire the DB with no manual URL editing. No-op for sqlite / already-drivered URLs.
+        # a deployment can auto-wire the DB with no manual URL editing. No-op for sqlite / already-drivered URLs.
         if v.startswith("postgres://"):
             v = "postgresql://" + v[len("postgres://") :]
         if v.startswith("postgresql://"):
             v = "postgresql+asyncpg://" + v[len("postgresql://") :]
         return v
+
+    # Pool sizing overrides, e.g. "admin.pool_size=4,background.pool_size=12". Empty = the defaults
+    # in `infra.db.POOL_SPECS`. This exists because pool sizing can only be validated in production:
+    # too small and real traffic gets 503s, too large and the bulkhead is decorative, and neither is
+    # visible from a test. A wrong number must be a dashboard edit, not a deploy.
+    db_pool_overrides: str = ""
 
     # Fernet key (urlsafe base64, 32 bytes). Generate with `treg keygen` (see crypto.py).
     # Empty in dev means an ephemeral key is minted at startup (secrets won't survive a restart).
@@ -101,7 +128,7 @@ class Settings(BaseSettings):
     # a code change — and so the ledger records the rate that was in force for each call.
     platform_margin: float = 0.0
     # The signup gift, in micro-USD (1e-6 USD): $1 buys ~1,600 catalog calls, enough for an agent to
-    # get real work done before it ever sees a payment form. Granted once, at org creation only.
+    # get real work done before it ever sees a payment form. Granted once per verified user, when creating an eligible team.
     promo_grant_micro: int = 1_000_000
     # Upstream HTTP timeout for a relayed call (the shared httpx client). Also the base of the hold
     # reaper's cutoff: a hold older than call_timeout_s + hold_grace_s belongs to a call that can no
@@ -148,7 +175,26 @@ class Settings(BaseSettings):
     platform_key_serpapi: str = ""
     platform_key_moz: str = ""          # base64 of "access_id:secret_key" (HTTP Basic)
     platform_key_seranking: str = ""
+    platform_key_trykitt: str = ""  # x-api-key; credits.jobCredits reports USD
+    platform_key_contactout: str = ""  # raw API token; injected into the token header
+    platform_key_millionverifier: str = ""  # raw key; injected as ?api=…
+    platform_key_bounceban: str = ""  # raw key in Authorization; prepaid verification credits
     platform_key_hunter: str = ""
+    platform_key_sumble: str = ""  # Bearer; Pro monthly credits, optional vendor auto-top-up
+    platform_key_moltsets: str = ""  # Bearer; shared subscription fair-use pools, no auto-top-up
+    platform_key_openmart: str = ""  # Bearer; monthly subscription credits, no auto-top-up
+    platform_key_harvestapi: str = ""  # X-API-Key; prepaid USD wallet
+    platform_key_anyapi: str = ""  # X-API-Key; prepaid USD wallet, exact charge settles from costUsd
+    platform_key_dropleads: str = ""  # X-API-Key; PAYG credits priced in fx.yaml
+    platform_key_quickenrich: str = ""  # Bearer; monthly subscription credits, not auto-top-up
+    platform_key_prospeo: str = ""  # X-KEY; Starter monthly subscription credits
+    platform_key_aiark: str = ""  # X-TOKEN; monthly subscription credits with rollover
+    platform_key_wiza: str = ""  # Bearer; prepaid API credits, no vendor auto-top-up
+    platform_key_limadata: str = ""  # x-api-key; monthly credits with configured auto top-up
+    platform_key_getleadsio: str = ""  # Bearer; 1,000 promotional database credits, capped treg trial
+    platform_key_scrubby: str = ""  # x-api-key; prepaid verification credits
+    platform_key_zerobounce: str = ""  # api_key query param; PAYG validation credits, Auto-Pay managed upstream
+    platform_key_datagma: str = ""  # apiId query param; prepaid purchased credits, replenished manually
     platform_key_leadmagic: str = ""
     platform_key_lusha: str = ""
     platform_key_pdl: str = ""
@@ -167,6 +213,7 @@ class Settings(BaseSettings):
     platform_key_finnhub: str = ""      # FREE-tier key — trial pool, 50 calls/team/day
     platform_key_twelvedata: str = ""   # FREE Basic key (800/day TOTAL) — trial pool, 20 calls/team/day
     platform_key_tiingo: str = ""       # FREE Starter key (1,000/day total) — trial pool, 20 calls/team/day
+    platform_key_financialdatasets: str = ""  # X-API-KEY; prepaid Credits with vendor auto-reload
     # ---- Enrichment expansion (2026-08-20). Slots only — fund the accounts and set the keys before
     # naming any of these in TREG_PLATFORM_PROVIDERS.
     platform_key_companyenrich: str = ""  # Bearer key
@@ -185,6 +232,12 @@ class Settings(BaseSettings):
     platform_key_aviato: str = ""     # Bearer key; $10 auto-top-up buys 1,000 credits
     platform_key_exa: str = ""        # x-api-key; dollar-metered ($7/1k searches, $1/1k pages); settles from costDollars.total
     platform_key_litescrape: str = ""  # Bearer key; flat $0.15/1k successful requests
+    platform_key_cloro: str = ""      # Bearer key (sk_live_…); Hobby metered rate $0.0004/credit; settles from X-Credits-Charged
+    platform_key_minimax: str = ""    # Bearer key for MiniMax voice, image and video generation
+    platform_key_openrouter: str = ""  # Bearer key for asynchronous routed generation
+    platform_key_replicate: str = ""  # Bearer token for official asynchronous models
+    platform_key_reapi: str = ""      # Bearer key; prepaid credits at $0.001, Seedance 2.5 + image models
+    platform_key_piapi: str = ""      # X-API-Key; prepaid USD balance, Seedance 2.5 less-restriction + image models
     # Overflow aggregators (docs/PROVIDER-CAPACITY-PLAN.md §4.3): treg-owned accounts that serve the
     # SAME vendor endpoint when our direct account is out. Env only, never a Secret row, never logged.
     # Not platform_key_* on purpose: they are a credential RUNG (platform-overflow), not a provider.
@@ -208,18 +261,18 @@ class Settings(BaseSettings):
     # it by default" are separate questions, and the second one is answered by traffic, not by
     # argument.
     routed_discovery: str = "on"
-    # Per-org, per-UTC-day ceiling on tier-4 spend, and the CEILING a team may raise its own
-    # `Org.daily_cap_micro` to. Enforced FAIL-CLOSED (unlike the soft per-user call cap): a query
-    # error refuses the call rather than letting an unbounded amount of our money out. It is a
-    # blast-radius limit on a runaway agent or a mispriced catalog entry, not a billing control —
-    # the balance is what a team actually spends against.
+    # DEFAULT per-org, per-UTC-day limit on tier-4 spend, for a team that has not set its own
+    # `Org.daily_cap_micro`. 0 = no default limit. A team may set its own figure to anything,
+    # including 0 for no limit — the limit is the team's protection against a runaway agent
+    # draining a balance that auto-top-up keeps refilling, and that is the team's call to make.
+    # Enforced FAIL-CLOSED when one applies (unlike the soft per-user call cap): a query error
+    # refuses the call rather than letting an unbounded amount out.
     #
-    # Raised 100 -> 500 on 2026-08-29. At 100 an ordinary day's work tripped it: a benchmark agent
-    # exploring the catalog spends ~$0.10 a query, and 26 of 32 briefs came back empty because every
-    # call after the ceiling 429'd — the team had $92 of balance and could not use it. The rail is
-    # still here, and it is still ours to raise per team; it just should not fire before a real
-    # workload does.
-    platform_daily_cap_usd: float = 500.0
+    # History: 100 -> 500 on 2026-08-29 (ordinary benchmark work tripped it with balance to spare),
+    # then 500 -> none in 2026-09. In two weeks the platform-wide figure fired only on two prepaid
+    # teams mid-workload (thousands of refused calls against a funded balance) and never on abuse;
+    # the prepaid balance and the auto-top-up monthly cap already bound what a team can spend.
+    platform_daily_cap_usd: float = 0.0
     # OAuth providers whose UPSTREAM bill lands on treg's developer app rather than the connected
     # user (X moved to pay-per-use in Feb 2026: the app owner is billed per resource read / per post
     # written, whoever's token made the call). Calls through a registry connect of a provider named
@@ -274,6 +327,35 @@ class Settings(BaseSettings):
     # fresh hits from the store). Any other value degrades to "off" — a typo must disable, never
     # enable. Staged deliberately so production can sit in "shadow" while phase 0 measures.
     archive_mode: str = "off"
+    archive_body_write: Literal["db", "both", "r2"] = "db"
+    archive_change_observation_enabled: bool = True
+    archive_body_read_lookup: Literal["db", "r2-first"] = "db"
+    archive_body_read_result: Literal["db", "r2-first"] = "db"
+    archive_body_read_terminal: Literal["db", "r2-first"] = "db"
+    archive_object_store_endpoint: str = ""
+    archive_object_store_bucket: str = ""
+    archive_object_store_access_key_id: str = Field(default="", repr=False)
+    archive_object_store_secret_access_key: str = Field(default="", repr=False)
+    archive_r2_upload_concurrency: int = Field(default=8, ge=1, le=128)
+    archive_r2_max_pending: int = Field(default=256, ge=1, le=4096)
+    archive_r2_max_pending_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    archive_r2_timeout_s: float = Field(default=10.0, gt=0, le=120)
+    archive_r2_read_timeout_s: float = Field(default=2.0, gt=0, le=120)
+    archive_r2_terminal_attempts: int = Field(default=3, ge=1, le=5)
+
+    # Comma-separated: exact endpoint IDs, "capability:<prefix>" families (capability:people.),
+    # or "*" for every endpoint the policy allows (the default; an operator narrows it to ids or
+    # families to stage a rollout). Empty means no serving, even in serve mode - the rollback
+    # lever.
+    archive_serve_endpoints: str = "*"
+    # Stable team/endpoint cohorts; 0 disables serving, 100 includes every team.
+    archive_serve_percent: int = 100
+    # What a metered REPEAT hit costs, as a percentage of the live price: a team's first call on a
+    # question pays full price whether the vendor or the archive answered it; from its second call
+    # on, a hit pays this share. 100 restores "a hit bills exactly like a live call".
+    archive_hit_repeat_price_percent: int = Field(default=10, ge=0, le=100)
+    # Operator freshness ceilings by exact endpoint ID; independent of vendor declarations.
+    archive_serve_max_age_s: dict[str, PositiveInt] = Field(default_factory=dict)
     # Bodies above this size are hash-counted but never stored (skipped whole, not truncated):
     # the archive is for API JSON answers, not downloads. Statistics still record size_bytes.
     archive_max_body_bytes: int = 2_000_000
@@ -286,7 +368,7 @@ class Settings(BaseSettings):
     # refresh calls ONE provider may spend per UTC day. A refresh is treg's own vendor spend with
     # no caller attached, so the cap is the brake — 0 disables refreshing without touching serving.
     archive_refresh_interval_s: int = 300
-    archive_refresh_daily_cap: int = 50
+    archive_refresh_daily_cap: int = 0
     # The pruner (profit-shaped: a stored body is inventory, and inventory that cannot sell goes
     # first). Runs whenever the archive records (shadow or serve); 0 batch disables it.
     archive_prune_interval_s: int = 3600       # one pass per hour
@@ -336,6 +418,10 @@ class Settings(BaseSettings):
     # ingestion key (safe to expose to the browser); host defaults to EU cloud.
     posthog_key: str = ""
     posthog_host: str = "https://eu.i.posthog.com"
+    # The code identity stamped on every analytics event as `build`. Empty means "use the commit the
+    # host exposes, else the installed package version" (analytics.build_id), so an operator only
+    # sets TREG_BUILD when the platform does not publish a commit variable.
+    build: str = ""
     # Intercom Messenger (support chat; treg's own workspace). Empty app_id = OFF, so self-hosted
     # instances never load the widget. The app_id is public (visible in page source); the secret
     # signs user_hash for identity verification and must never reach the browser.
@@ -393,6 +479,9 @@ class Settings(BaseSettings):
     # the Facebook Login app credentials above.
     instagram_client_id: str = ""
     instagram_client_secret: str = ""
+    # Comma-separated registry review keys that do not yet have production access. Remove one key
+    # when its review is approved; set an explicit empty value when all reviews are complete.
+    oauth_review_pending: str = "instagram-login,page-messages"
     # Advertising OAuth platforms — unset by default, so these providers list as "not configured"
     # until this deployment registers its own developer app on each network.
     microsoft_ads_client_id: str = ""
@@ -413,6 +502,21 @@ class Settings(BaseSettings):
     # response, which is an unauthenticated account-takeover vector in prod — so it defaults OFF and
     # must be explicitly enabled (TREG_EMAIL_DEV_MODE=true) for local testing without a mail sender.
     email_dev_mode: bool = False
+
+    # The WHOLE email-domain blocklist (TREG_BLOCKED_EMAIL_DOMAINS), comma-separated:
+    # "example-one.io,example-two.net". There is no list in the code; empty (the default) blocks
+    # nothing. A listed domain blocks itself AND every subdomain, case-insensitively, at every
+    # sign-up and sign-in door and at the two doors that create a promo-funded team (POST /users,
+    # POST /orgs). Configuration rather than code because bulk registration moves to a new domain in
+    # minutes, and a defence that needs a deploy to keep up is always behind. Existing accounts on a
+    # listed domain are suspended out of band, so listing one strands nobody legitimate. A blocklist,
+    # deliberately: no allowlist, no table, no admin UI.
+    blocked_email_domains: str = ""
+
+    @property
+    def blocked_email_domain_set(self) -> frozenset[str]:
+        """The normalised `TREG_BLOCKED_EMAIL_DOMAINS` entries; empty = nothing is blocked."""
+        return _blocked_email_domains(self.blocked_email_domains)
 
     # Frictionless local mode: `curl … | sh` brings up a server you are already signed into, with no
     # account, email or password. Only takes effect when `single_user_ok` allows it (see below).
@@ -440,12 +544,21 @@ class Settings(BaseSettings):
         """The allow-listed tier-4 providers (comma-separated `TREG_PLATFORM_PROVIDERS`)."""
         return frozenset(p.strip().lower() for p in self.platform_providers.split(",") if p.strip())
 
+    def platform_provider_enabled(self, provider: str) -> bool:
+        """Whether this deployment allows a catalog fallback for `provider`.
+
+        Most fallbacks also need `platform_key_for`. A catalog endpoint explicitly verified as
+        anonymous needs only this operator-controlled switch because no provider credential or
+        provider balance is used.
+        """
+        return (provider or "").lower() in self.platform_provider_set
+
     def platform_key_for(self, provider: str) -> str | None:
         """treg's own key for `provider`, or None if tier 4 must not serve it. BOTH conditions have to
         hold — the provider is allow-listed AND a key is configured — so neither half alone can start
         spending our money. Returns the value only; callers put the SETTING NAME in the binding
         (`platform_setting_name`) so the key itself never travels through a tool row."""
-        if (provider or "").lower() not in self.platform_provider_set:
+        if not self.platform_provider_enabled(provider):
             return None
         return getattr(self, platform_setting_name(provider), "") or None
 
@@ -465,6 +578,13 @@ class Settings(BaseSettings):
         """OAuth providers whose registry-connect calls are metered (comma-separated
         `TREG_OAUTH_BILLED_PROVIDERS`). Empty = the current free behavior."""
         return frozenset(p.strip().lower() for p in self.oauth_billed_providers.split(",") if p.strip())
+
+    @property
+    def oauth_review_pending_set(self) -> frozenset[str]:
+        """Provider-registry review keys awaiting production access."""
+        return frozenset(
+            key.strip().lower() for key in self.oauth_review_pending.split(",") if key.strip()
+        )
 
     @property
     def expose_dev_code(self) -> bool:

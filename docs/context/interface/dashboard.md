@@ -4,6 +4,7 @@ status: shipped
 sources:
   - src/treg/web/sitetrack.js
   - src/treg/web/index.html
+  - src/treg/web/agent-setup.js
   - src/treg/web/vendor/README.md
   - src/treg/web/vendor/vue-3.5.41.global.prod.js
   - src/treg/web/tutorial.js
@@ -13,6 +14,8 @@ sources:
   - src/treg/api.py
   - src/treg/routers/web.py
   - src/treg/domain/identity/session.py
+  - src/treg/routers/api_keys.py
+  - tests/test_api_keys.py
 related:
   - interface/api.md
   - interface/landing-sandbox.md
@@ -24,19 +27,77 @@ related:
 
 # Web dashboard (Phase 1)
 
+## Team API Keys
+
+Team has an **API Keys** tab for every member. A member sees their own keys. An admin or owner sees
+the full team inventory grouped by human owner: an agent created by that human is visually nested in
+the human's table while remaining a separate agent identity, key, role, cap, and access scope. An
+agent whose creator is no longer a visible human remains a standalone group. Each compact row stacks
+the key name, type, and masked safe prefix in one identity column, followed by state, creation time, last use,
+and allowed actions; the human-owner group makes a repeated creator column unnecessary. A scoped agent group uses its
+readable name and keeps the internal machine email as secondary safe metadata. Create and rotate show
+the complete secret once in a copy card. Agent rotation first expands a compact confirmation in the
+affected row, then the one-time card says the old key stopped, provides the direct environment and
+agent-specific setup instructions, warns that any bearer can act as that agent, and closes with an
+explicit `I’ve updated <agent>` acknowledgement. The rotated predecessor is hidden from the normal
+inventory but remains in audit history. Agent-key revoke explains that it removes the agent membership
+and revokes all of that agent's keys, then reloads Members so the removed agent disappears immediately.
+The Members tab uses matching confirmations for rotate and agent revoke; access saves use one dismissible confirmation that the key
+is unchanged and the new scope applies immediately. These lifecycle messages exist only during the
+action or immediately after it, rather than as persistent page banners. The Default row derives a
+safe prefix from the same signed team token used by Getting Started. Its row offers Rotate, Disable,
+and Enable but not Revoke. Rotate confirms that the prior team token stops, then shows a compact copy
+card with the new full token and CLI/MCP update guidance. The same token remains revealable on Getting
+Started, and rotation does not create a second key row. A migrated Legacy row without recorded prefix says
+`prefix unavailable — older key`; a fresh human membership has no Legacy row.
+
+The tab provides rename, disable, enable, rotate, revoke, and hide only when the API says the caller
+can use that action. To keep dense rows readable, Activity and Rotate remain visible while Rename,
+Disable/Enable, Revoke, and Hide live in a custom overflow menu. Rotate, Disable, Revoke, and Hide use
+an impact-specific confirmation modal; Enable and Rename remain immediate. Member-row agent actions
+stay visible but use consistent spacing. Submitting an empty additional-key name marks only its input
+red; the mark clears on the next edit instead of occupying the page with a validation banner. Each key row opens Activity with that key selected. The
+Activity feed also has an all-keys selector and a Key column. Old records show no key.
+For an agent key, Who uses the readable assigned agent name and adds an `owner: <human>` chip from
+the key creator metadata; the internal `agent-{team}-{name}@agents.treg.local` identity stays hidden.
+The Key chip shows its safe prefix visibly, so Activity from pre- and post-rotation keys with the same
+name remains distinguishable.
+Human Activity rows keep their existing short email identity.
+The loaded Activity window counts calls served from the archive and shows that summary only when it
+contains a cache hit. Each cached call also carries a quiet `Cached` pill beside its actual charge;
+the displayed amount remains the settled charge from `/calls`, including free own-key hits and
+reduced metered repeat hits. The key selector and success filter continue to operate independently.
+
+Catalog provider choices show each endpoint's optional `name` below the provider name.
+Names wrap and are included in the platform filter. This distinguishes tools that use the
+same provider and API path, such as Harvest's basic and full profile variants. The rule
+applies to all providers; entries without a name retain the provider label.
+
+The endpoint Try drawer treats `catalog_endpoint_access` as the access truth. An `anonymous` tier is
+callable in the Manual tab, says that no provider key is used, and does not show the own-key action as
+a requirement. Activity uses `servedOn` to distinguish a public provider route from a team key, a
+registered tool, treg's platform key, and platform overflow. CLI and API instructions also avoid
+claiming credential injection for an anonymous call.
+
 ## Instagram authorization state
 
 The primary **Add account** action opens one method picker for providers with several separate OAuth
-grants. For Instagram it selects **Instagram Login** by default and marks it recommended; the user
-can instead select **Facebook Page tools**, whose option explains that it requires an Instagram
-Professional account linked to a Facebook Page, then one **Continue** action starts the selected
-flow. Choosing Instagram Login then opens the existing least-privilege capability picker for
-**Read only**, **Read and publish**, or **Full access**; the single-capability Facebook Page grant
-continues directly. Providers with zero or one authorization method keep their existing
-one-click/capability flow. Reconnect stays pinned to the connection's stored method. Method labels
-come from `oauth_providers.listing()`; the shared template does not know method ids. The registry
-marks a provider configured when any declared method is configured, and the picker selects the
-recommended method only when that method is available.
+grants. Registry review metadata and `TREG_OAUTH_REVIEW_PENDING` define the effective experience.
+With both Instagram review keys pending, Instagram selects the approved **Facebook Page tools** flow
+for plain Connect. Direct **Instagram Login** stays available for app-role testing and its registry
+text states the review limit. The Page method opens a generic capability picker: core Page tools use
+approved scopes, while **Facebook Page tools + messages** is an explicit widening for reviewers and
+test roles. Pending methods and capability choices carry a registry-driven **In review** badge; an
+approved fallback method does not inherit the badge from its optional wider capability. After Page
+messaging approval, its key is removed: the badge, warning, and extra Page capability
+picker disappear, and the two Page permission cards merge into one full Page-tools card. Page
+connections then request messages. After direct approval, its key is also
+removed: direct Instagram Login returns as the recommended method and loses its review badge.
+Providers with zero or one authorization method keep their existing one-click/capability flow.
+Reconnect stays pinned to the connection's stored method and chooses its widest granted capability.
+Method, capability, help, and action labels come from `oauth_providers.listing()`; the shared template
+does not know provider or method ids. The registry marks a provider configured when any declared
+method is configured.
 
 The provider page has no method-status alert: healthy and optional states live in the connection
 rows and permission cards, while alert styling remains reserved for real errors or setup gaps. Each
@@ -117,6 +178,19 @@ is still reachable (welcome flow, in-app links); (bottom)
 the **account** block — avatar · email · theme · sign out. The old top-bar org dropdown and top-right
 account controls are gone.
 
+## Standalone Enrich Arena
+
+Signed-in users have an **Arena** sidebar link immediately after **Refer a friend**. It opens
+`/enrich-arena` in a new tab, with an external-link icon aligned to the right. The link is also
+available in the mobile navigation drawer.
+
+`/enrich-arena` and `/enrich-arena/leaderboard` share Arena | Leaderboard navigation, their
+own public layout and account controls, outside the dashboard shell. Arena keeps the vendor
+stats table; Leaderboard contains metric charts and task/input filters.
+It checks authentication on query submission, preserves the query across login, and spends the
+selected team's normal credits. Google/GitHub accept an allowlisted Arena return cookie; other
+dashboard and CLI login destinations retain their existing behavior. See [Enrich Arena](enrich-arena.md).
+
 ## Auth — three doors
 Two are **session** (cookie) paths, one is a token fallback:
 - **GitHub (`githubLogin`):** `Continue with GitHub` → `/auth/github` → callback sets a signed HttpOnly
@@ -130,12 +204,13 @@ Two are **session** (cookie) paths, one is a token fallback:
 - Either way the dashboard authenticates with the **cookie** (`credentials:'include'`) + picks the org
   with **`X-Treg-Org`**, detected via `/auth/me` on load. Cookie `Secure` only on HTTPS (`_is_https`).
   For copy-paste convenience it also fetches `GET /auth/cli-token` on load into `myToken` — sent WITH
-  the active-org header, so the minted identity token is **team-pinned** (`sess.make(..., org=slug)`,
+  the active-org header, so the minted identity token is **team-pinned** (`sess.make_identity(..., org=slug)`,
   a stateless `org` claim; the endpoint only pins a team the caller is a member of). That is the point:
   the "API key" then works as a **bare bearer** — pasted into an MCP server's `Authorization` header,
   where no `X-Treg-Org` can travel, it still resolves to that team (fixing the "several teams, none
-  active" wall a multi-team user hit). `require_member` uses the token's org claim when no header is
-  sent (the header still overrides), and the MCP layer surfaces it via `_internal_auth`. `myToken` is
+  active" wall a multi-team user hit). New Default keys carry `scp=team`, so `require_member` treats
+  the token's org claim as authoritative and rejects a conflicting header; only older untyped keys
+  retain header-first compatibility. The MCP layer surfaces the signed team via `_internal_auth`. `myToken` is
   re-minted whenever the active org changes (`_myTokenOrg` guard) so it always names the shown team.
   The per-tool snippets embed it (+ `X-Treg-Org`, now redundant but harmless), and **"Copy API token"**
   (`copyToken`) puts it on the clipboard.
@@ -164,8 +239,10 @@ empty Tools state offers `jumpToTeam()`.
 
 The session cookie is HMAC-signed with `TREG_SESSION_SECRET`/`TREG_SECRET_KEY`, falling back to a
 **random per-process key** when neither is set (never a source-visible constant — that would make
-cookies forgeable for any uid, incl. a superadmin). It also carries a **`tv` (token_version)** claim
-(`sess.make`/`read_claims`); a mismatch against `User.token_version` = revoked, so `POST
+cookies forgeable for any uid, incl. a superadmin). New cookies carry signed `aud=session` and a 7-day
+`exp`; copied API tokens carry `aud=identity` and no `exp`, so neither credential can cross into the
+other path. Both also carry a **`tv` (token_version)** claim; a mismatch against
+`User.token_version` = revoked, so `POST
 /auth/revoke-tokens` can invalidate a user's cookies + CLI tokens without rotating the shared secret. In **token mode** the dashboard carries `org_id`
 on the active org (so `activeOrgId` resolves and org-admin writes work), fetches `me` via `/auth/me`
 (so `isPersonal` + join-by-code work), and persists a newly-created org's returned token so the team is
@@ -275,7 +352,11 @@ Server side (`domain.identity.access`): `require_identity` (who, from token OR s
     it; the setup webhook then arms the policy. A team that already has a mandate sees a read-only
     "auto top-up is on" line instead. The preselected card is `topup.default_usd`, which is per-org:
     one preset above the last manual top-up, capped at $50 (see [money](../architecture/money.md)).
-  - **Team settings** — deliberately JUST the **Danger zone** (leave / delete), visible to EVERY role
+  - **Team settings** — the daily spend limit, a **Team name and slug** form (admin+, prefilled from
+    the active team by `resetRenameForm` on tab open and on team switch; Save is enabled only when a
+    value differs and `renameOrg` sends just the changed fields to `PATCH /orgs/{id}`; on a slug
+    change the active slug in `localStorage`/`cfg.orgs` follows the new one and the page reloads its
+    lists) and the **Danger zone** (leave / delete), visible to EVERY role
     (leaving is self-service, and `loadOrgAdmin` lands a non-admin here). New team / Join by code /
     Paste token live only in the sidebar picker — cut from this tab on founder review; a personal
     team shows a one-line explainer instead of an empty page.
@@ -287,8 +368,9 @@ Server side (`domain.identity.access`): `require_identity` (who, from token OR s
   rows with a **Scope this agent** button (`promoteObserved`) that opens the Add-agent form
   prefilled and linked (`promotePending` → `promoted_from`, so the detected row disappears on
   Create and returns on revoke). "Add to this team" toggles **＋ Add member** (invite) |
-  **＋ Add agent** (mint form: name / role / cap + project picker `agentProjSel`, all-checked =
-  omitted = every project). The once-only token card renders at the top of the tab. Rotate
+  **＋ Add agent** (mint form: name / role / cap, an explicit **All tools** or **Choose tools**
+  decision, and project picker `agentProjSel`; Create stays disabled until tool scope is chosen,
+  and Choose starts with no silent grants). The once-only token card renders at the top of the tab. Rotate
   (re-POSTs the same name, so the old token dies), **Revoke**, and an inline cap editor. Rotate sends
   only `{name, role, daily_call_cap}` **on purpose**: `create_agent` leaves every field the client does
   not send exactly as it was, so the agent's tool ACL and project scope survive the rotate. They used to
@@ -308,8 +390,10 @@ Server side (`domain.identity.access`): `require_identity` (who, from token OR s
   `welcomeAgents`/`welcomeMoreAgents` with the first-run modal; "Docs" links `/tutorial`; the pick is
   remembered in `localStorage` `treg-agent`) above an **"install the treg plugin"** link for agents whose
   entry carries a `plugin` URL (Grok Bot) and the per-agent setup line (`welcomeSetupCmd` = `buildAgentPrompt` — `set up treg — <proxy>/llms.txt with token <T>, team <slug>`; the long multi-step agent prompt is retired, llms.txt itself now carries the setup flow, the do-not-stop authorization framing and the star ask, and its money rules no longer demand per-call price confirmation) and, combined into the
-  same card, **Your API key** (`myToken`, masked with a `startTokenShow` reveal + copy — the key
-  already exists, so there is no "create key" step). **② Try it out** — four copyable example
+  same card, **Your API key** (`myToken`, masked with a `startTokenShow` reveal + copy — the signed
+  team Default can be derived and revealed repeatedly, unlike one-time hash-backed additional and
+  agent secrets). If its control is disabled, no token is rendered and a compact **Enable key** action
+  is shown. **② Try it out** — four copyable example
   prompts (`tryExamples`, category-labeled `.try-card`s: Social/Trends/SEO/Enrichment — concrete
   live-data asks a bare agent can't answer), then an `.oauth-div` divider ("also connect OAuth
   accounts for new agent capabilities") over three grouped rows of `.prov-chip` logo chips
@@ -323,6 +407,13 @@ Server side (`domain.identity.access`): `require_identity` (who, from token OR s
 - **Activity** — one time-sorted feed (`activityRows`) merging `GET /calls` (proxy calls) + `GET /runs`
   (CLI executions). Local runs now arrive via `/runs` (tagged `where`), so the calls feed **excludes**
   `local_run` rows to avoid double-counting, and each run row shows a **local/server** chip.
+  A row whose `/calls` payload carries `async_task` (a metered generation) renders the task's state
+  as a chip next to the HTTP badge (`taskStateLabel`: `generating…` / `done` / `failed · refunded` /
+  `timed out`), shows the reserve as **`hold $x`** while pending (the server nulls the charge until
+  the task settles), and once done appends the artifact to the Action cell: a `result ↗` link to the
+  provider's time-limited URL (tooltip from `taskArtifactTitle` carries the `ttl_note` and when it
+  was generated) or a `result via CLI` chip whose tooltip is the retrieval command for fetch-mode
+  routes. treg never proxies or stores the media itself.
   The feed shows **successes only by default** (`actOkOnly`, `activityShown` filters on `ok`);
   a "Show all (N)" / "Successes only" button toggles failed and refused rows in, and the empty
   state offers the same switch when every recent call failed.
@@ -341,7 +432,9 @@ Server side (`domain.identity.access`): `require_identity` (who, from token OR s
 - **First-run onboarding** — a brand-new user has **zero teams** (no auto personal org), so `maybeOnboard`
   shows a **mandatory "name your team" welcome** (`welcome.*`; team name pre-suggested from the email
   domain via `_suggestTeamName`). Step 0 is NOT dismissable — no skip, survives Escape/backdrop — the only
-  action is `welcomeCreate` (`POST /orgs`, marks onboarded). Three more steps follow **inside the same
+  action is `welcomeCreate` (`POST /orgs`, marks onboarded). The agent picker and setup instruction
+  components and the final Try it out step are shared with Enrich Arena through `/agent-setup.js`, including client definitions,
+  logo URLs, the optional plugin step and masked/copyable credentials. Three more steps follow **inside the same
   modal**: an **agent picker** (`welcome.step===1` — OpenClaw / Grok Bot / Hermes Agent / Claude.ai /
   Claude Code / Codex, plus a "More" expander with opencode / pi / Cursor / Gemini CLI / Other; LobeHub icons via
   unpkg, theme-aware light/dark variants through `agentIcon`, except Grok Bot's bundled
@@ -495,7 +588,7 @@ account can I attach?" — see `architecture/catalog.md` for the data behind it,
 **default** view. `loadPlatforms` reads **`GET /catalog/platforms`** (once per session; cached on
 `plats.loaded`), whose rows carry a **`category`** and a **`featured`** rank (`int|null`). `platCategories`
 groups the rows **by whatever category they carry**, sorts those groups into the founder's canonical
-reading order (SEO · Social · Advertising · Enrichment · E-commerce · Reviews & Apps · China Social ·
+reading order (Enrichment · SEO/AEO · Social · Advertising · E-commerce · Reviews & Apps · AI generation ·
 Community, then anything new alphabetically) and **drops `Other`** — the taxonomy's bucket for things like
 `account`, whose capabilities only make sense inside a platform page, never as a tile. The order list is
 only an *order*: a category the catalog invents still gets a shelf and a tab, at the end — but at the end
@@ -555,10 +648,13 @@ platform without opening it, and every field comes off the `/catalog/platforms` 
   provider with no published rate stays silent. Note that `price_from` arrives as `null` *or* as an
   empty `{}`, and the empty object has to be normalised to null first — being truthy, it otherwise
   short-circuits the auth-kind branch and silently costs an OAuth-only platform its "free with your
-  account".
+  account". A grouped scalar rate such as MiniMax TTS supplies `display_usd` plus `display_unit`, so
+  the card says `$0.60 / 10000 characters` instead of rounding the normalized per-character rate
+  down to an unreadable number.
 
 **Prices are unified USD.** Every price the marketplace displays — the card footer, the capability card's
-"from", and the per-endpoint cost chip — is the **server's computed `usd`** field on `cost` / `price_from`,
+"from", and the per-endpoint cost chip — comes from the server's price object on `cost` / `price_from`:
+normally its computed **`usd`**, or its equivalent grouped **`display_usd` / `display_unit`** pair,
 formatted by `usdNum`: two significant figures under a dollar (`$0.015`, `$0.00015`), cents at or above one.
 The FX table lives in the catalog (`fx.yaml`) so a rate refresh re-prices every surface at once, and the
 dashboard carries **no** conversion constant of its own — one here would drift from the CLI the moment the
@@ -753,8 +849,9 @@ selector. Changing it swaps the visible method-specific inputs and updates the A
 and direct-call representations together. The selector label comes from the provider registry,
 not a method-id lookup in the template. Instagram Login is the first/default method on shared
 Instagram endpoints. The selector appears only when both grants are connected; one connected grant
-is selected automatically, while no connected grant keeps the recommended Instagram Login default
-and the ordinary catalog access guidance.
+is selected automatically, while no connected grant keeps the endpoint's recommended method and the
+ordinary catalog access guidance. If a connected grant lacks an endpoint's scopes, the drawer gives
+the smallest registry-defined capability upgrade and its registry-defined action label.
 
 **Example responses** load when their tab is FIRST opened (`setEpTab` → `loadExample`, guarded by
 `if(this.platEx[e.id]) return`), never with the page and never twice — a platform can carry hundreds of
@@ -959,6 +1056,13 @@ again asks anyone to add funds.
 `GET /referrals` mints the code as well as sweeping, so the page is one call and `link` is never
 empty on a first visit.
 
+**Two programs, forked at the header (`refTab`).** The "Refer a friend" tab is the credit program
+above. The "Affiliate partner" tab is the invite-only cash tier: three short sections and a button
+to an application form, no treg state behind it. It is a fork rather than a card under the referral
+column because a card there read as step four of the referral program. Hand-approval via the form is
+the anti-gaming design (see money), so nothing on that tab is self-serve, and it renders for
+everyone, team or not. The cap card points at the tab instead of a support address.
+
 **Every status renders a reason** (`refStatus`), including `capped` and `rejected`. "I referred
 someone and got nothing" is the ticket this program generates, and the answer belongs on the page
 rather than in an email to us.
@@ -979,3 +1083,23 @@ made a correct payout look like a failure. Both are needed — the
 amount is chosen at the buttons, and the first preset ($5) is below the $10 minimum, so a note on its
 own would let the most-clicked button quietly forfeit the reward. Null offer = the page renders
 exactly as it did before this shipped.
+
+## Sumble catalog presentation
+
+Company data contains 25 Sumble operations; People & contact data contains people search and
+four contact-list operations. Account operations and helpers use the existing management expander.
+Endpoint details use credential-registry `auth_kind` and the configured `metered` flag to distinguish
+platform + BYOK, BYOK only and OAuth connections. Routed tools retain their own label. Public
+catalog responses include the same provider facts for signed-out visitors. No free-call claim is
+inferred from platform eligibility alone. Provider pills keep the endpoint that supplied the price. `costLabel` and `costTitle` consume `cost_view` display metadata
+for selected-attribute pricing, rounded lookup blocks and per-technology charges. Billing notes
+remain available in expanded details.
+
+## Arena attribution at the dashboard boundary
+
+The credit link from Arena opens `/app?from=enrich-arena#billing`. `sitetrack.js` snapshots that
+entry point before SPA navigation can remove the query, and both manual top-up actions send
+`checkout_source=arena` (ordinary app entry sends `app`). First-observed acquisition surface is
+kept separately in the `treg_entry_surface` cookie. `analyticsIdentify` delegates to the shared
+`TregTracking` identity/group helper, matching the Arena-to-app person and clearing stale team
+groups on switches. See [Arena conversion tracking](enrich-arena.md#conversion-tracking).

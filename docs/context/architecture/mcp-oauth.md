@@ -7,11 +7,15 @@ sources:
   - src/treg/domain/identity/health.py
   - src/treg/domain/identity/mcp_oauth.py
   - src/treg/domain/identity/session.py
+  - src/treg/domain/identity/access.py
+  - src/treg/domain/identity/api_keys.py
+  - src/treg/routers/api_keys.py
   - src/treg/routers/auth.py
   - src/treg/web/claude-connector.html
   - src/treg/web/connect-demo.html
   - docs/CLAUDE-CONNECTOR-SUBMISSION.md
   - tests/test_mcp.py
+  - tests/test_mcp_oauth.py
   - tests/test_mcp_directory.py
   - tests/test_marketplace_call.py
 related:
@@ -22,6 +26,28 @@ related:
 ---
 
 # MCP
+
+## Feedback
+
+Both transports expose `feedback(category, message, call_ids?, endpoint_id?)`, using a four-value
+category enum and the shared HTTP intake. This is an additive, non-destructive write on treg,
+not an upstream call. It requires the existing transport identity and spends no balance.
+Both also expose `review(call_id, usefulness, reason?)` as a non-destructive, non-idempotent local
+write relayed to `/reviews`, using the shared usefulness enum and description.
+See [feedback](feedback.md) for invitation sampling and hint priority. V2 retains its catalog-only calling boundary.
+
+## Managed bearer keys
+
+Both `/mcp/` and `/mcp/v2/` accept an active managed key as a direct bearer. MCP tools pass that
+bearer to the normal API, so disable and revoke take effect on the next tool call. The transport can
+still list static tool schemas before it validates a non-OAuth bearer; this does not grant data or
+call access. A seven-day `scp=bootstrap` login token is not a team bearer and cannot call either MCP
+surface; `treg mcp install` rejects it before writing any client configuration. Use a team Default,
+Additional, or Agent key instead.
+
+MCP OAuth access and refresh tokens remain typed, short-lived bridge credentials with separate V1
+and V2 audiences. They do not resolve through an `ApiKey` row and do not use a default-key control.
+This keeps OAuth refresh and audience isolation unchanged.
 
 ## Provider authorization remediation
 
@@ -75,6 +101,7 @@ of shared behavior.
 | endpoint details | the `/catalog/endpoints/{id}` route and error shape | client attribution |
 | calls | request assembly, credentials, policy, limits, idempotency, relay, errors, metering, audit | team MCP accepts team tools; V2 accepts catalog ids only and splits read/write methods |
 | balance | team selection, grant labels, balance route, error shape | client attribution |
+| feedback | `/feedback`, categories, privacy guidance, team scope and limits | client attribution |
 | catalog requests | `/tool-requests`, rate limit, field limits, caller IP | event source and client attribution |
 | transport | host checks, compression, cache headers, eager auth, static capabilities | V2 has a separate audience, metadata path, scope marker, and Claude browser origin |
 | lifecycle | the transport factory and `mcp_lifespan` | V2 mount and lifespan depend on its feature flag |
@@ -89,7 +116,7 @@ shared behavior and must also prove the listed differences. Keep these V2 proper
 new directory review approves a contract change:
 
 - `/mcp/v2/` is the stable URL, and `/mcp/v2` resolves to the same resource.
-- The tool list has exactly six tools.
+- The tool list has seven tools, including `feedback`; directory submissions must reflect this schema.
 - V2 accepts catalog ids only. It does not list or call arbitrary team tools or passthrough paths.
 - Read and write calls stay separate, and their annotations match their method classes.
 - V1 and V2 OAuth audiences do not cross.
@@ -104,7 +131,7 @@ details, balance, catalog-call results, errors, catalog-only hints, and client a
 `tests/test_marketplace_call.py` proves that the catalog-only API route cannot be shadowed by a
 same-named team tool. A change is incomplete if only one relevant MCP test file is reviewed.
 
-## Team MCP at `/mcp/`: six tools
+## Team MCP at `/mcp/`
 
 | Tool | Job |
 |---|---|
@@ -113,6 +140,7 @@ same-named team tool. A change is incomplete if only one relevant MCP test file 
 | `call` | a catalog endpoint by id, or `<tool-name>/<path>` for the team's own tool |
 | `balance` | the team's prepaid balance |
 | `my_tools` | what the team registered that can be called without holding the key |
+| `feedback` | submit a private problem report or suggestion |
 | `catalog_request` | file what the catalog is MISSING — the demand signal for what gets added next |
 
 Deliberately not one tool per provider. A catalog of 2,600 endpoints exposed as 2,600 MCP tools would
@@ -121,7 +149,7 @@ plus `call` covers all of it and stays the same size.
 
 ## Fixed surface — no change subscriptions
 
-The six-tool MCP surface is static. Weekly catalog refreshes change the DATA returned by
+The MCP surface is static at runtime. Weekly catalog refreshes change the DATA returned by
 `catalog_search` and `catalog_get`; they do not change `tools/list`. treg also publishes no tool,
 prompt or resource change events. `server/discover` therefore advertises
 `tools.listChanged=false`, `prompts.listChanged=false`, `resources.listChanged=false`, and
@@ -136,7 +164,7 @@ idle SSE streams which can never deliver useful work.
 `call` is annotated **destructive + open-world + non-idempotent**, which reads as pessimistic until
 you notice treg does not model the upstream: it relays to somebody else's API and cannot know whether
 that endpoint charges, writes or deletes. Claiming otherwise would be a guess presented as a fact.
-`catalog_request` is the one other non-read: a write, but a harmless one (a row on treg itself,
+`feedback` and `catalog_request` are the other non-reads. `catalog_request` is a write, but a harmless one (a row on treg itself,
 nothing upstream, nothing spent), so it stays closed-world and non-destructive. It relays to
 `POST /tool-requests` so rate limiting and field caps live in one place, forwarding the edge's
 `X-Forwarded-For` — the in-process relay would otherwise collapse every MCP caller into one
@@ -197,6 +225,16 @@ Optional, and it is the caller's. Pass the same key when repeating a call whose 
 treg replays the stored response, does not reach the provider, and charges nothing, with
 `replayed: true` on the result.
 
+## `call` says when the overflow relay served it
+
+`/call/` discloses a relayed answer in `X-Treg-Served-Via`; an MCP client never sees headers, so
+`_call_impl` lifts it into `served_via` on the result with a one-line `hint` naming the relay and
+the exhausted provider (`cost_usd` is then the relay's real price, not the catalog's direct one).
+Both surfaces share the impl, so `/mcp/` and `/mcp/v2/` say it identically. `catalog_get` carries
+`overflow_price_usd` / `overflow_price_unit` / `overflow_via` for the same reason - the price to
+tell the human BEFORE the call includes the one the relay may bill (`architecture/money.md`
+§ Overflow money).
+
 It exists because the feature was built for agents and MCP is the agent path. Without it the whole
 thing was unreachable from the surface it was for.
 
@@ -233,14 +271,14 @@ server's own outbound validation refuse the whole catalog entry.
 
 ## Responses are gzip-compressed at the origin — the edge must find nothing to do
 
-Production sits behind Render's managed edge — no account or dashboard of ours — which
-Brotli-compresses large responses on the way out. At least one real client stack (httpx +
+The hosted service sits behind a managed edge which can Brotli-compress large responses on the way
+out. At least one real client stack (httpx +
 brotlicffi, issue #93) dies mid-decode on that output and then hangs to its own timeout, minutes
 after the upstream answered in seconds.
 
 The first fix was `Cache-Control: no-store, no-transform` (the `NoTransformResponses` wrapper,
 outermost so 401 challenges carry it too) — the origin's standard "do not re-encode" (RFC 9111).
-**Render's edge ignores it** (issue #100: `content-encoding: br` arrived in production right next to
+**The managed edge ignores it** (issue #100: `content-encoding: br` arrived in production next to
 the header). The header stays because it is correct and free, but the working fix is different: the
 MCP app gzips its own responses (`GZipMiddleware` inside `build_mcp_app`, ≥1KB). An edge only
 compresses what arrives uncompressed — a response already carrying `Content-Encoding: gzip` passes
@@ -369,11 +407,9 @@ happened before the balances were added.
 
 ### …but the choice must stay visible and reversible afterwards
 
-Decided-once became **invisible and permanent**, and that combination cost a user real money
-(2026-08-17). `balance` reported the slug `superdesign-7`; `treg org ls` on their machine listed
-`superdesign` and `ai-jason` and nothing else, because the CLI was signed in as a *different account*
-from the one that had clicked Allow. Nothing in the agent could tell a plausible slug from the wrong
-team, and the first signal was spend on a balance nobody had opened. Two halves to the fix:
+Decided-once became **invisible and permanent**, and that combination caused spend against the wrong
+team when the CLI and OAuth client used different identities. Nothing in the agent could tell a
+plausible slug from the intended team. Two halves to the fix:
 
 - **`balance` and `my_tools` label the grant**: `team_name` (a slug alone cannot be sanity-checked)
   and `identity` — the account the grant belongs to, which is usually the half that differs. If the
@@ -441,10 +477,13 @@ binary creates during the rolling-deploy window.
 
 ## Tokens are exchanged, not forwarded
 
-`_internal_auth` validates an OAuth access token and presents it onward as a short-lived (120s)
-identity token for the user it names, pinned to the org on the grant. That keeps OAuth inside `mcp.py`
+`_internal_auth` validates an OAuth access token and presents it onward as a short-lived (120s), typed
+`aud=identity` token for the user it names, pinned to the org on the grant. Its explicit expiry is
+enforced even though normal copied identity keys have no expiry. That keeps OAuth inside `mcp.py`
 instead of teaching `require_member` a third token type, and it means `_resolve_org` must honour the
-pinned team rather than re-deriving it.
+pinned team rather than re-deriving it. For a native identity bearer, `_internal_auth` uses
+`read_identity_claims` to surface the signed team pin; it never interprets a typed browser session as
+a bearer.
 
 Both were found by running the flow rather than testing the pieces: `_oauth_claims` validated tokens
 perfectly while every tool still forwarded the raw bearer and got "not signed in".
@@ -484,10 +523,19 @@ the installer uses: a **team-pinned token as an `Authorization: Bearer` header**
 (`mcp_install.py`, sibling of `treg skill bootstrap`) registers the server into every supported agent
 with that header — Claude Code via its own `claude mcp add --scope user` (user-global, not the
 default project scope; it owns its format and redacts the token), Cursor and opencode via their
-documented JSON (`~/.cursor/mcp.json`, `~/.config/opencode/opencode.json`). Codex (TOML +
-`bearer_token_env_var`), Hermes (yaml) and OpenClaw are **reported, not written** — their formats
-aren't safely expressible from the light CLI (no toml writer, yaml is a server-only dep), so we print
-the exact manual step rather than a config we haven't runtime-verified.
+documented JSON (`~/.cursor/mcp.json`, `~/.config/opencode/opencode.json`), Codex as one
+`[mcp_servers.treg]` table in `~/.codex/config.toml` with an inline `http_headers` map. Stdlib has no
+TOML writer, so `_write_toml_agent` cuts out any previous `[mcp_servers.treg]` table as text, appends
+a fresh one, and only lands the file when `tomllib` parses it back to exactly our entry. Hermes
+(yaml) and OpenClaw are **reported, not written** — their formats aren't safely expressible from the
+light CLI (yaml is a server-only dep), so we print the exact manual step instead.
+
+**Codex must get the token inline, never by `bearer_token_env_var`.** The old manual step said
+"set TREG_TOKEN in its environment"; a user's agent did exactly that, the Codex app restarted
+without the variable, treg answered 401 and Codex dropped every treg tool silently. The agent then
+drove the dashboard through Codex's own browser and spent the user's daily Codex allowance on a
+$0.13 job. Live-verified on codex-cli 0.144: `http_headers = { "Authorization" = "Bearer …" }` loads
+the tools; an `X-Treg-Token` header does NOT (the MCP surface answers 401 and starts OAuth).
 
 The command **verifies the token against `/auth/me` before writing anything** — the same check
 `treg login --token` runs. Learned the hard way: without it, a garbage token fans out silently into
@@ -497,6 +545,12 @@ which makes it look like a provider outage rather than a setup problem. The garb
 the test suite's own dummy: `install_mcp(only=[])` read an empty list as "no filter" and wrote
 `Bearer K` into the developer's real configs on every suite run — `only=[]` now means *none*, and
 the test isolates HOME.
+
+Before that verification, the installer also recognizes the signed `scp=bootstrap` hint and exits
+without writes. The server remains authoritative—the local decode grants nothing—but this gives a
+clear setup error instead of installing a credential that cannot identify a billing team. MCP OAuth
+access/refresh flows are unchanged; their internal 120-second bridge identity remains a separate
+typed path.
 
 Why a header works even though treg advertises OAuth: a client only falls back to OAuth discovery on
 a **401**, and treg returns **200** for a valid header — verified against Claude Code, which

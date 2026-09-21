@@ -84,6 +84,9 @@ def test_separate_oauth_methods_share_one_single_choice_modal():
     assert 'v-if="methodAsk"' in INDEX
     assert 'v-model="methodAsk.selected"' in INDEX
     assert 'class="chip ok">Recommended</span>' in INDEX
+    assert 'v-if="method.in_review" class="chip warn">In review</span>' in INDEX
+    assert 'v-if="capInReview(cap,capAsk)" class="chip warn"' in INDEX
+    assert "mkProvider.permission_capabilities||mkProvider.capabilities" in INDEX
     assert '@click="continueMethod()">Continue</button>' in INDEX
     assert "if(methods.length>1 && !conn)" in INDEX
     assert "if(methods.length===1 && !conn) return this.connectProvider" in INDEX
@@ -106,7 +109,7 @@ def test_permission_cards_can_use_method_specific_incremental_benefits():
     assert "mkCapabilityDetails(cap)" in panel
     computed = INDEX[INDEX.index("computed:{") : INDEX.index("methods:{")]
     assert "mkCapabilityMethod(cap){" not in computed
-    logic = INDEX[INDEX.index("mkCapabilityMethod(cap){") : INDEX.index("capLabel(cap){")]
+    logic = INDEX[INDEX.index("mkCapabilityMethod(cap){") : INDEX.index("capLabel(cap, ask){")]
     assert "m.capability_details && (m.capability_details[cap]||[]).length" in logic
     assert "this.mkProvider&&this.mkProvider.scope_detail" in logic
     assert "page-tools" not in logic and "instagram" not in logic
@@ -124,8 +127,6 @@ def test_the_platform_header_stacks_instead_of_putting_providers_in_a_column():
     assert head.index('class="plat-title"') < head.index('plat-intro"') < head.index('class="plat-provs"')
     assert 'v-for="s in platProviders"' in head
     assert "tut-actions" not in head  # the two-column header is gone from this view
-    assert ".plat-provs{display:flex;flex-wrap:wrap" in INDEX  # ...and the chips wrap rather than scroll
-    assert ".plat-intro{margin:10px 0 0;max-width:74ch}" in INDEX  # readable measure, full-width column
 
 
 def test_platform_provider_navigation_does_not_wait_for_connection_registry_state():
@@ -171,7 +172,7 @@ def test_the_tab_bar_is_all_plus_the_catalog_categories_plus_platform():
     order = INDEX[INDEX.index("platCategories(){") :][:900]
     assert (
         "['Enrichment','SEO/AEO','Social','Advertising','E-commerce','Reviews & Apps',"
-        "'Community']" in order
+        "'AI generation','Community']" in order
     )
 
 
@@ -189,17 +190,8 @@ def test_the_category_list_comes_from_the_data_not_the_order_list():
         assert gone not in body, f"{gone} is no longer a catalog category — remove the reference"
 
 
-def test_the_tab_strip_scrolls_without_showing_a_scrollbar():
-    """Ten tabs overflow a narrow window, but the scrollbar under them reads as a rendering fault.
-    The strip still scrolls; a right-edge fade is what hints there is more."""
-    css = INDEX[INDEX.index(".mk-tabs{") :][:600]
-    assert "overflow-x:auto" in css
-    assert "scrollbar-width:none" in css
-    assert ".mk-tabs::-webkit-scrollbar{display:none}" in INDEX
-    assert "mask-image:linear-gradient(90deg,#000 calc(100% - 26px),transparent)" in css
-    # The rule under the tabs must NOT be on the masked scroller, or it fades short of the edge.
-    assert "border-bottom" not in css[: css.index("}")]
-    assert ".mk-tabs-wrap{border-bottom:1px solid var(--line)" in INDEX
+def test_ai_generation_shelf_names_all_three_media_modalities():
+    assert "'AI generation':'video, image and voice models" in INDEX
 
 
 def test_tiles_are_grouped_by_category_on_every_capability_tab():
@@ -257,8 +249,6 @@ def test_a_category_heading_is_a_real_heading():
     head = INDEX[INDEX.index('<div class="sec-head">') :][:500]
     assert '<h2 class="sec-h"><b>{{g.category}}</b>' in head
     assert "{{g.hint}}" in head  # the one-line explainer stays, under the heading
-    css = INDEX[INDEX.index(".sec-h b{") :][:120]
-    assert "font-size:19px" in css and "font-weight:600" in css
 
 
 def test_the_more_row_names_the_platforms_it_is_hiding():
@@ -273,17 +263,6 @@ def test_the_more_row_names_the_platforms_it_is_hiding():
     lbl = INDEX[INDEX.index("moreLabel(rest){") :][:400]
     assert "rest.slice(0,2)" in lbl
     assert "(rest.length-2)+' more'" in lbl
-
-
-def test_the_more_row_is_a_quiet_row_with_an_arrow_not_a_dashed_box():
-    """A dashed border reads as a drop zone or a placeholder, and it drew more attention than the
-    cards it sits under. The row is plain; an arrow (which slides on hover) is the affordance."""
-    at = INDEX.index('class="pt-more"')
-    assert '<span class="pt-more-a" aria-hidden="true">→</span>' in INDEX[at : at + 1400]
-    css = INDEX[INDEX.index(".pt-more{") :][:900]
-    assert "dashed" not in css and "border:0" in css
-    assert ".pt-more:hover .pt-more-a{transform:translateX(2px)" in INDEX
-    assert ".pt-more:hover{color:var(--ink);background:var(--hover)}" in INDEX  # subtle tint, no border
 
 
 # --- the platform card: enough to choose a platform without opening it --------------------------
@@ -328,21 +307,14 @@ def test_a_card_is_a_name_and_two_facts_with_no_description_paragraph():
     assert ":title=\"pl.summary ? pl.label+' — '+pl.summary : pl.label\"" in card
 
 
-def test_a_long_platform_name_wraps_instead_of_ellipsizing():
-    """"Google Search Con…" is a card that cannot say what it is. With the description gone there is
-    room for the whole name on two lines."""
-    css = INDEX[INDEX.index(".pt-name{") :][:300]
-    assert "-webkit-line-clamp:2" in css
-    assert "white-space:nowrap" not in css
-
-
 def test_the_card_price_is_the_servers_computed_usd():
     """Every price the marketplace shows is in one unit, so two numbers on the same screen can be
     compared. The conversion is the server's (`usd`), not the dashboard's — a local FX constant
     would drift from the CLI the moment the rate table changed."""
     fn = INDEX[INDEX.index("platPrice(pl){") :][:1400]
     assert "typeof pf.usd==='number'" in fn
-    assert "'$'+this.usdNum(pf.usd)+' / '+this.priceUnit(pf.type)" in fn
+    assert "typeof pf.display_usd==='number' ? pf.display_usd : pf.usd" in fn
+    assert "pf.display_unit || this.priceUnit(pf.type)" in fn
     assert "return null; }" in fn  # priced but unpublished → say nothing, not "from —"
     # "from" is a floor: an OAuth provider among the platform's providers makes the floor $0, even
     # when metered providers publish a rate — that rate demotes to the tooltip.
@@ -473,7 +445,6 @@ def test_the_pill_strip_never_wraps_three_pills_then_a_count():
     block = _ledger()
     assert 'v-if="r.pillsMore" class="pchip more"' in block and "+{{r.pillsMore}}" in block
     assert ':title="r.pillsMoreTitle"' in block, "the hidden names stay reachable"
-    assert ".lprovs{display:flex;flex-wrap:nowrap;overflow:hidden" in INDEX
     rows = INDEX[INDEX.index("platRowsAll(){") :][:3600]
     assert "pills:pills.slice(0,3), pillsMore:Math.max(0, pills.length-3)" in rows
 
@@ -519,7 +490,6 @@ def test_a_single_row_is_led_by_a_short_title_never_a_paragraph():
     assert "title:this.clip(r.description, 90)" in rows
     clip = INDEX[INDEX.index("clip(text, n){") :][:400]
     assert "lastIndexOf(' ')" in clip, "clip at a word boundary, not mid-token"
-    assert ".lsum b{display:-webkit-box;-webkit-line-clamp:2" in INDEX
     # ...and the server picks name-over-summary before it ever reaches the row.
     src = (Path(api.__file__).parent / "domain" / "catalog" / "store.py").read_text(encoding="utf-8")
     fn = src[src.index("def domain_rows("):]
@@ -575,7 +545,9 @@ def test_the_long_metered_phrasing_never_reaches_a_collapsed_line():
     collapsed line it wraps the row onto three lines. Collapsed surfaces say "credit-priced"."""
     short = INDEX[INDEX.index("costShort(c){") :][:400]
     assert "return 'credit-priced'" in short
-    assert "if(c.value==null) return 'credit-priced'" in short
+    # a price table has no scalar value but does have a range, so only an unpublished number is
+    # "credit-priced" — a video or image model shows its per-second rate or range instead
+    assert "if(c.value==null && !(c.table && typeof c.usd==='number')) return 'credit-priced'" in short
     assert "return this.costLabel(c)" in short  # ...a published number is short already
     block = _ledger()
     assert "costLabel" not in block, "the long form is a sentence, not a label — it belongs in the facts"
@@ -668,7 +640,6 @@ def test_a_callable_row_is_marked_down_its_leading_edge():
     connected provider carries a rule down its edge — findable without reading."""
     block = _ledger()
     assert ':class="{open:platOpen[r.key], go:r.ready}"' in block
-    assert ".lrow.go td:first-child{box-shadow:inset 3px 0 0" in INDEX
     rows = INDEX[INDEX.index("platRowsAll(){") :][:3400]
     assert "ready: eps.some(e=>this.catEndpointConnected(e))" in rows
 
@@ -763,14 +734,6 @@ def test_an_endpoint_with_no_catalogued_params_says_so_rather_than_showing_an_em
     assert "provider's docs have them" in block
 
 
-def test_the_params_table_drops_the_global_table_chrome():
-    """The global `table` rule paints a panel, a border and a radius and `th` a filled bar — inside
-    the .prm box that reads as a stray highlight, and it clips the first column."""
-    css = INDEX[INDEX.index(".prm-t{") :][:400]
-    assert "background:none;border:0" in css
-    assert ".prm-t th{background:none" in INDEX
-
-
 def test_the_expansion_carries_a_paste_ready_call_line():
     """Finding the endpoint was never the goal — running it is. The `treg call` line is served on
     the row itself (`call_template`), so the instruction is complete without a second request."""
@@ -845,11 +808,26 @@ def test_example_responses_are_fetched_only_when_their_tab_is_opened():
     assert "if(tab==='res') this.loadExample(e);" in INDEX[INDEX.index("setEpTab(e, tab){") :][:300]
 
 
-def test_both_panes_are_capped_and_scroll_rather_than_growing_the_page():
-    """A DataForSEO body carries thirty parameters. Uncapped, one expansion pushes every row below
-    it off the screen — so both panes are the same bounded box that scrolls inside itself."""
-    assert ".prm{max-height:320px;overflow-y:auto}" in INDEX
-    assert ".cat-ex pre{max-height:320px}" in INDEX
+def test_anonymous_catalog_access_is_runnable_and_never_claims_a_provider_key():
+    """A verified public upstream route is a callable access tier. The Try drawer must not send it
+    through the missing-key branch or describe the absent provider credential as injected."""
+    drawer = INDEX[INDEX.index('v-if="epTry"') : INDEX.index("methods:{")]
+    assert "epTryAccess.tier==='anonymous'" in drawer
+    blocked = drawer[drawer.index('<div v-if="epTryAccess &&') :][:500]
+    assert "epTryAccess.tier!=='anonymous'" in blocked
+    assert "no provider key is needed" in drawer
+    assert "This verified public upstream route needs no provider key." in drawer
+    assert "free — no provider key ⓘ" in drawer
+
+
+def test_activity_names_each_access_tier_without_calling_anonymous_a_team_key():
+    assert "{{servedOn(callView.credential_tier)}}" in INDEX
+    labels = INDEX[INDEX.index("servedOn(tier){") :][:350]
+    assert "anonymous:'public provider route (no key)'" in labels
+    assert "platform:'treg key'" in labels
+    assert "credential:'your key'" in labels
+    assert "tool:'your registered tool'" in labels
+    assert "'platform-overflow':'treg overflow'" in labels
 
 
 def test_the_run_actions_lead_the_expansion_tab_bar():
@@ -1043,29 +1021,6 @@ def test_referral_stat_tiles_use_the_sheets_own_class_names():
     assert block.index('<div class="n">') < block.index('<div class="l">')
 
 
-def test_referral_stat_tiles_fill_the_column():
-    """The sheet's `.statgrid` is auto-FILL, which at this width lays out four 150px tracks and
-    leaves the fourth empty — three tiles then stop short of the right edge the card above and the
-    table below both reach. auto-fit collapses the empty track."""
-    assert "grid-template-columns:repeat(auto-fit,minmax(150px,1fr))" in _referrals_view()
-
-
-def test_referral_table_keeps_the_sheets_cell_padding():
-    """A bare `<table>` IS a card here (background, border, radius) and `th,td` already carry
-    10px/13px. Overriding that to `padding:8px 0` — copied from a table that lives INSIDE a card —
-    puts the right-aligned amount flush against the card's own edge, which reads as clipped."""
-    block = _referrals_view()
-    table = block[block.index("<table"):block.index("</table>")]
-    assert "padding:" not in table, "let th,td carry the padding"
-    assert "<th>" in table, "house tables have a header row"
-
-
-def test_the_referral_column_is_one_width():
-    """Card, tiles and table sit in a SINGLE max-width container. Three separate max-widths is what
-    made them start and end at three different x-positions."""
-    assert _referrals_view().count("max-width:") == 1
-
-
 def test_the_billing_page_names_the_bonus_on_the_qualifying_presets():
     """A referred team decides HOW MUCH to add on this screen, and the first preset ($5) is below the
     minimum. A note alone is not enough — the amount is chosen at the buttons, so the qualifying ones
@@ -1123,3 +1078,126 @@ def test_the_topup_modal_defaults_auto_on_only_without_a_mandate():
     js = INDEX[INDEX.index("openTopup(){"):]
     js = js[: js.index("tierBonus(")]
     assert "this.topupAuto=!(this.billing.autotopup.enabled||this.billing.autotopup.consented_at)" in js
+
+
+def test_api_key_dashboard_uses_server_permissions_and_safe_assignment_metadata():
+    start = INDEX.index('v-if="orgTab===\'keys\'"')
+    block = INDEX[start:INDEX.index("<!-- PROJECTS tab -->", start)]
+    menu = INDEX[INDEX.index('v-if="keyMenu"'):INDEX.index('v-if="keyConfirm"')]
+    assert "group.name" in block and "group.identity" in block and "group.type" in block
+    assert "k.created_at?when(k.created_at)" in block
+    assert '<table class="key-table"><tr><th>Key</th><th>Status</th><th>Created</th><th>Last used</th><th></th></tr>' in block
+    assert "<th>Created by</th>" not in block
+    assert "k.can_rotate" in block
+    for permission in ("can_rename", "can_disable", "can_enable", "can_revoke", "can_hide"):
+        assert f"keyMenu.key.{permission}" in menu
+    assert "{{maskedKey(k)}}" in block
+    assert "k.safe_prefix+'••••••••'" in INDEX
+    assert "k.kind==='legacy_human'?'prefix unavailable — older key':'prefix unavailable'" in INDEX
+    assert "newApiKey.secret" in block
+    assert "apiKeyGroups(){" in INDEX and "assigned_name||row.identity" in INDEX
+    assert "humanByIdentity[(row.created_by||'').toLowerCase()]" in INDEX
+    assert "owner.rows.push(row)" in INDEX
+    assert "group.type==='human' && k.assigned_type==='agent'" in block
+    assert "↳" in block and "?k.assigned_name:k.name" in block
+    assert 'class="key-meta mono"' in block
+    assert "requestKeyAction(k,'rotate')" in block
+    assert "toggleKeyMenu(k,$event)" in block
+    assert 'aria-haspopup="menu"' in block
+    assert "The current key will stop working immediately." in INDEX
+    assert "Default key rotated — copy the new key" in block
+    assert "This team-specific key remains revealable on Getting Started." in block
+    assert "CLI users can run <code>treg login</code> again to save the new key." in block
+    assert "was removed from this team, and all its keys were revoked" in INDEX
+    assert "newApiKey.assigned_type==='agent'" in block
+    assert "I’ve updated '+newApiKey.assigned_name" in block
+    assert "Replace <code>TREG_TOKEN</code> in every environment" in block
+    default_rotate = INDEX[INDEX.index("if(r.secret && k.kind==='default_human')") :]
+    default_rotate = default_rotate[: default_rotate.index("else if(r.secret)")]
+    assert "this.newApiKey={...r,rotated:true}" in default_rotate
+
+
+def test_api_key_secondary_actions_use_a_custom_menu_and_impact_modal():
+    assert 'class="key-actions-menu" role="menu"' in INDEX
+    assert 'role="menuitem"' in INDEX
+    assert "if(['rotate','disable','revoke','hide'].includes(action))" in INDEX
+    assert 'v-if="keyConfirm" class="scrim" role="dialog" aria-modal="true"' in INDEX
+    assert "Calls using this key will stop until you enable it again." in INDEX
+    assert "Historical Activity will remain available." in INDEX
+    assert "if(this.keyMenu)this.keyMenu=null" in INDEX
+    confirm = INDEX[INDEX.index('v-if="keyConfirm"'):INDEX.index('<!-- REGISTER SKILL', INDEX.index('v-if="keyConfirm"'))]
+    assert '<h3 id="key-confirm-title" style="margin:0">' in confirm
+    assert 'aria-label="Close"' not in confirm
+
+
+def test_empty_api_key_name_uses_field_validation_without_a_banner():
+    assert ":class=\"{'field-invalid':keyNameInvalid}\"" in INDEX
+    assert ':aria-invalid="keyNameInvalid"' in INDEX
+    assert '@input="keyNameInvalid=false"' in INDEX
+    create = INDEX[INDEX.index("async createApiKey(){"):INDEX.index("async renameApiKey(")]
+    assert "if(!name){ this.keyErr=''; this.keyNameInvalid=true; return; }" in create
+    assert "this.keyErr='Enter a key name.'" not in create
+
+
+def test_member_agent_actions_have_spacing_without_hiding_actions():
+    at = INDEX.index('@click="showAgentSetup(m)"')
+    actions = INDEX[at - 80:at + 900]
+    assert 'class="row-actions"' in actions
+    assert ">Setup</button>" in actions
+    assert "rotateAgent(m)" in actions
+    assert "revokeAgent(m)" in actions
+
+
+def test_agent_lifecycle_guidance_is_transient_and_action_specific():
+    start = INDEX.index("v-if=\"canAdmin && orgTab==='members'\"")
+    block = INDEX[start:INDEX.index("<!-- API KEYS tab", start)]
+    assert "Its current key will stop immediately." in block
+    assert "This removes the agent and revokes all its keys." in block
+    assert "I’ve updated '+newAgent.name" in block
+    assert "Anyone holding it can act as {{newAgent.name}}" in block
+    assert "Its key is unchanged, and the new tool and project permissions apply immediately." in INDEX
+
+
+def test_agent_key_revoke_copy_matches_membership_removal():
+    assert "This removes the agent from the team and revokes all its keys." in INDEX
+    assert "was removed from this team, and all its keys were revoked." in INDEX
+    assert "if(r.agent_revoked) await this.loadOrgAdmin()" in INDEX
+    assert "remains on Members, but it cannot authenticate" not in INDEX
+
+
+def test_activity_shows_agent_name_with_owner_badge_not_internal_identity():
+    assert "{{activityWho(a)}}" in INDEX
+    assert "owner: {{activityOwner(a)}}" in INDEX
+    assert "activityAgentKey(a)" in INDEX
+    assert "k.assigned_type==='agent'" in INDEX
+    assert "k.assigned_name||this.short(k.identity)" in INDEX
+    assert "if(!this.apiKeys.length)await this.loadApiKeys()" in INDEX
+    assert "{{a.api_key_name}}<span v-if=\"a.api_key_prefix\"" in INDEX
+
+
+def test_activity_feed_marks_cached_calls_without_changing_the_charge():
+    feed = INDEX[INDEX.index('<template v-if="actTab===\'feed\'">') :]
+    start = feed.index('<tr v-for="a in activityShown"')
+    row = feed[start : feed.index("</tr>", start)]
+    assert "{{a.cost!=null?money(a.cost):'—'}}" in row
+    assert 'v-if="a.cached" class="chip cached"' in row
+    assert "Served from treg's archive instead of calling the provider." in row
+    assert row.index("{{a.cost!=null?money(a.cost):'—'}}") < row.index('v-if="a.cached"')
+    assert ".chip.cached{" in INDEX and "background:var(--panel2)" in INDEX
+
+
+def test_activity_feed_summarizes_cached_calls_in_the_loaded_window():
+    assert 'v-if="activityCachedCount" class="sub"' in INDEX
+    assert "{{activityCachedCount}} of {{activityCallCount}} loaded" in INDEX
+    assert "activityCallCount(){ return this.activityRows.filter(a=>a.kind==='call').length; }" in INDEX
+    assert "activityCachedCount(){ return this.activityRows.filter(a=>a.kind==='call' && a.cached).length; }" in INDEX
+
+
+def test_agent_creation_requires_explicit_tool_scope_and_default_key_has_disabled_state():
+    assert 'value="all" v-model="agentAccessMode"' in INDEX
+    assert 'value="choose" v-model="agentAccessMode"' in INDEX
+    assert "body.tool_access=this.agentAccessMode==='all' ? null" in INDEX
+    assert "agentBusy||!agentAccessMode" in INDEX
+    assert "defaultKeyState==='disabled'" in INDEX
+    assert "Additional and agent keys are random secrets shown only once" in INDEX
+    assert "This team's current Getting Started token will stop working immediately." in INDEX

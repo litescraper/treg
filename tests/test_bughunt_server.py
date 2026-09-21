@@ -40,7 +40,7 @@ async def c():
     app.state.http = AsyncClient(transport=ASGITransport(app=make_upstream()), base_url="http://upstream")
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://registry",
-        headers={"ngrok-skip-browser-warning": "1"},
+        headers={"ngrok-skip-browser-warning": "1", "X-Treg-Key-Protocol": "1"},
     ) as client:
         yield client
     await app.state.http.aclose()
@@ -105,8 +105,8 @@ async def test_session_key_not_hardcoded_constant():
         sig = hmac.new(b"dev-session-key", raw, hashlib.sha256).digest()
         b = lambda x: base64.urlsafe_b64encode(x).decode().rstrip("=")
         forged = f"{b(raw)}.{b(sig)}"
-        assert sess.read(forged) is None  # the constant no longer signs anything
-        assert sess.read(sess.make(7)) == 7  # real tokens still work
+        assert sess.read_session(forged) is None  # the constant no longer signs anything
+        assert sess.read_session(sess.make_session(7)) == 7  # real tokens still work
     finally:
         object.__setattr__(s, "session_secret", prev[0])
         object.__setattr__(s, "secret_key", prev[1])

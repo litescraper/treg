@@ -10,6 +10,12 @@ Faithfulness contract — it alters ONLY these, everything else is relayed verba
      from the Cookie header too (the dashboard's `credentials:'include'` Try-it would otherwise leak
      our session token to the upstream); any other caller cookies are preserved.
   3. the credential(s) the tool's bindings inject — overwrite only their target header/param.
+  4. on treg's SHARED key only (tier 4), the caller's `Idempotency-Key` is re-scoped per org by
+     `scope_shared_idempotency_key` before the request is built. Every org shares one provider
+     account there, so a provider that honors the header would hand org B the job org A created
+     under the same label — and the ownership record would then make B its owner (reproduced live
+     against LeadsForge, 2026-09-09). The caller loses nothing: treg's own idempotency table already
+     replays their answer for the same label. A team's own key relays the header verbatim.
 
 It never buffers the body (rule 5: stream, don't duplicate) and uses the shared long-lived
 httpx client (rule 1: keepalive). Secrets are passed already-loaded (api does the DB work).
@@ -18,6 +24,7 @@ httpx client (rule 1: keepalive). Secrets are passed already-loaded (api does th
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -54,6 +61,25 @@ _DROP_REQUEST = _HOP_BY_HOP | _CONTROL
 def _is_dropped_request_header(name: str, extra: frozenset[str]) -> bool:
     """Whether a caller header is ours/hop-by-hop and must not reach the upstream."""
     return name in _DROP_REQUEST or name in extra or name.startswith(_TREG_PREFIX)
+
+
+_IDEMPOTENCY_HEADER = b"idempotency-key"
+
+
+def scope_shared_idempotency_key(
+    raw_headers: tuple[tuple[bytes, bytes], ...], org_id: int,
+) -> tuple[tuple[bytes, bytes], ...]:
+    """Rewrite 4 of the faithfulness contract: partition the caller's idempotency label by org.
+
+    Only for calls on treg's shared provider key. The value is an opaque, fixed-length digest of
+    (org, label): two orgs can never collide on the provider's account, and the same org retrying the
+    same label still hits the provider's own dedupe should treg's replay window miss it.
+    """
+    return tuple(
+        (k, hashlib.sha256(f"{org_id}\x1f".encode() + v).hexdigest().encode())
+        if k.lower() == _IDEMPOTENCY_HEADER else (k, v)
+        for k, v in raw_headers
+    )
 _DROP_RESPONSE = _HOP_BY_HOP
 _TREG_COOKIES = frozenset({"treg_session", "treg_oauth_state"})  # our cookies, scrubbed from Cookie
 
@@ -146,9 +172,21 @@ async def relay(
     # makes httpx frame the request `Transfer-Encoding: chunked`, putting a bogus body-frame on a
     # GET/HEAD/OPTIONS (which strict upstreams reject).
     content = request.body_stream() if request.has_body else None
-    upstream_req = client.build_request(
-        request.method, upstream_url, headers=headers, params=params, content=content
-    )
+    # A streamed body with no length makes httpx frame it `Transfer-Encoding: chunked`. The bytes are
+    # the caller's, unaltered, so the caller's own Content-Length is exact — carry it, and httpx
+    # frames the upstream request with it instead. Meta's Graph API edge does not read a chunked
+    # request body: every JSON/form/multipart POST arrived as a bodyless request, and an ad creative
+    # sent that way failed "Ad incomplete" (live 2026-09-19). A caller who streamed chunked stays chunked.
+    if content is not None and (cl := _header_value(request.raw_headers, "content-length")):
+        headers["content-length"] = cl
+    # Merge the query onto the URL rather than passing params=: httpx REPLACES a URL's existing
+    # query whenever params is given (even an empty list), which silently stripped a catalog path's
+    # own query — LinkedIn's `/rest/images?action=initializeUpload`, Facebook's `?is_hidden=true`.
+    # Same trap, same fix as the health probe (health.py).
+    url = httpx.URL(upstream_url)
+    for k, v in params:
+        url = url.copy_add_param(k, v)
+    upstream_req = client.build_request(request.method, url, headers=headers, content=content)
     # Call-time SSRF guard: resolve the upstream host NOW and refuse an internal target — defeats DNS
     # rebinding (base_url was public at registration, its DNS now points at 169.254.169.254 / localhost).
     from . import health  # local: health imports proxy-adjacent modules, so keep the cycle lazy

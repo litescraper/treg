@@ -33,6 +33,8 @@ source:
 pricing_url: https://leadmagic.io/pricing
 endpoints:
   - id: leadmagic.people.email.find
+    cache:
+      ignore_paths: ["processed_at"]
     domain: contacts
     capability: people.email.find
     platform: people
@@ -68,6 +70,8 @@ endpoints:
     docs_url: https://leadmagic.io/docs/api-reference/email-finder
 
   - id: leadmagic.people.email.verify
+    cache:
+      ignore_paths: ["validated_at", "credits_consumed", "pipeline_version", "message", "validation_path_code"]
     domain: contacts
     capability: people.email.verify
     platform: people
@@ -101,6 +105,9 @@ endpoints:
   - id: leadmagic.people.enrich
     domain: contacts
     capability: people.enrich
+    miss:
+      status: 404
+      means: "`profile_not_found` — no matching profile for the identifiers, an expected outcome and free; do not retry the same identifiers"
     platform: people
     scope: any_account
     method: POST

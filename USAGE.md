@@ -72,6 +72,7 @@ only what they created; admin/owner manage anything in the org; admin+ can invit
 | `treg org create` | `"NAME"` | create a new org; you become its owner (new token, auto-active) |
 | `treg org ls` | — | list your orgs (marks the active one) |
 | `treg org use` | `SLUG` | switch the active org |
+| `treg org rename` | `--name "NAME"`, `--slug SLUG` | (admin+) rename the active org and/or change its slug; existing keys keep working |
 | `treg org invite` | `EMAIL`, `--role member\|admin` | (admin+) create a one-time invite **code** to share |
 | `treg org members` | — | (admin+) list members + roles |
 | `treg org join` | `CODE`, `--email EMAIL` | redeem a code: registers you if new, joins, saves the org token |
@@ -136,6 +137,8 @@ treg tool add google-ads --base-url https://googleads.googleapis.com \
 | `treg catalog search` | `"what you want to do"` | find endpoints by capability |
 | `treg catalog get` | `ENDPOINT_ID` | docs, parameters, **the price**, and how you would be served |
 | `treg call ENDPOINT_ID` | `--query K=V`, `--data STR` | call it |
+| `treg call ENDPOINT_ID --await` | `--timeout N` (default 900) | a generation call (video/image): submit, poll the provider, print the final response |
+| `treg host FILE` | `--content-type T`, `--json` | host a reference image/audio/video at a public URL a vendor can fetch (30 MB, 7-day TTL, free); prints the URL for `image_urls` / `audio_urls` |
 | `treg catalog request` | `"what's missing"` | searched, not there? file it — requests steer what gets added next |
 
 ```bash
@@ -143,6 +146,14 @@ treg catalog search "instagram profile"
 treg catalog get tikhub.tiktok.user.profile          # shows the price BEFORE you spend
 treg call tikhub.tiktok.user.profile --query uniqueId=tiktok
 ```
+
+**Video and image generation** (`video-gen` / `image-gen` platforms) are async tasks: the call returns
+a task id, and `--await` polls until it finishes. Stdout is the final response only; stderr gets the
+task id, a resumable `treg call …` command, progress and the result URL. Exit 0 = done, 2 = the
+provider failed the task, 3 = timed out (resume with the printed command). Money is reserved at
+submission and charged only on success; a failed task refunds the hold. Result URLs are time-limited
+(download promptly; treg never stores media). From a coding agent, raise the shell tool's timeout or
+run the call in the background - a video takes 1-5 minutes. `treg audit` shows each task's state.
 
 **How a catalogued call is served — the credential ladder, in order:**
 
@@ -153,6 +164,25 @@ treg call tikhub.tiktok.user.profile --query uniqueId=tiktok
 Rung 3 only applies where treg has both a key and a published price for that endpoint; anything
 unpriced is refused rather than served, and you are told to connect your own key. Your own key is
 never billed to the balance.
+
+## Review a catalog call
+
+`treg review <call_id> <useful|partly|not_useful|not_sure> [--reason "text"]` rates a catalog
+call after you have used the result. Phase 1 invites only direct catalog calls served on treg's
+own platform key; sampled calls print an invitation on stderr. Routed and own-key catalog calls
+can still be reviewed uninvited. `not_sure` is fine when you cannot tell. The optional reason is
+1-200 characters after trimming. Omit private data and raw payloads. Use `feedback` for anything confusing or wrong, then keep going
+with the task. The receipt contains `review_id` and `status` (`received` or `already_reviewed`).
+If the call record is not written yet, retry shortly with the same call ID.
+
+## Feedback
+
+`treg feedback submit <quality|pricing|friction|other> "message"` submits a problem or suggestion to the
+configured registry, under the active team. Add `--call-id ID` (repeatable) or `--endpoint-id ID`
+when available. Message `-` reads a prepared, sanitized description from stdin. The command
+returns a `feedback_id`. Omit private information and raw requests, responses or logs.
+Retrieve a report with `treg feedback get <feedback_id>`.
+See `treg feedback --help` and your registry's `/feedback.md` for details.
 
 ## Balance & top-up
 
@@ -203,7 +233,7 @@ returns `{output, raw, _treg: {served_by, tried, charged_micro}}` plus `X-Treg-S
 vendor 4xx is your request's fault and stops. A **miss** tries the next provider too (the waterfall,
 on by default), cheapest first, within `X-Treg-Route-Max-Cost` (default $1 per call); every
 attempt settles at its real price and misses on per-success providers are free. `X-Treg-Route-Waterfall: 0`
-stops at the first miss. `X-Treg-Route-Prefer` / `X-Treg-Route-Exclude` name providers. Vendor endpoints are still relayed verbatim; only `treg.*` rows model an API.
+stops at the first miss. `X-Treg-Route-Prefer` / `X-Treg-Route-Exclude` name providers. A filter the serving provider could not apply is named in `X-Treg-Ignored-Filters` (and `_treg.ignored_filters`); `X-Treg-Route-Strict-Filters: 1` refuses such a call with a 422 (unbilled) instead. Vendor endpoints are still relayed verbatim; only `treg.*` rows model an API.
 
 ## Calling
 
@@ -432,3 +462,15 @@ credential that stops working and webhooks the owner (if a `webhook_url` was set
 - `secret_file` — a JSON token file; pull `secret_field`
 - `oauth` — a JSON OAuth token; pull `secret_field` (auto-refreshed if refreshable)
 - `cli_auth` — material lifted from a CLI's keychain (placed like a string)
+
+## Anonymous usage analytics
+
+When using treg.to, the CLI sends basic usage through PostHog: command name, success/exit code,
+duration, CLI version and OS, linked to a random local installation ID. It does not send command
+arguments, credentials, request/response content, email or team identifiers. Help and argument
+parsing errors are not tracked. Analytics adds at most 1 second of waiting at command exit;
+slow or offline delivery may be dropped.
+
+Disable it with `export TREG_TELEMETRY=0` (or `DO_NOT_TRACK=1`). Self-hosted registries default to
+no analytics; set `TREG_CLI_POSTHOG_KEY` and optionally `TREG_CLI_POSTHOG_HOST` to use your own
+PostHog project. The random ID is stored in `analytics-id` beside the CLI config file.

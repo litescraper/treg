@@ -16,7 +16,8 @@ the user, and it asks for authority the capability doesn't need.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from urllib.parse import urlsplit
 
 from .config import platform_setting_name, get_settings
 from .domain.connections import authorization as connection_authorization
@@ -24,6 +25,22 @@ from .domain.connections import authorization as connection_authorization
 
 # Compatibility name for callers that still import provider definitions from this legacy module.
 OAuthAuthorizationMethod = connection_authorization.AuthorizationMethod
+
+
+@dataclass(frozen=True)
+class CatalogTarget:
+    """An additional approved upstream root for this provider's catalog endpoints.
+
+    Catalog YAML may select one by exact hostname, but cannot introduce a new credential target.
+    Empty auth fields inherit the provider's normal injection profile.
+    """
+
+    host: str
+    base_url: str
+    token_location: str = ""
+    token_header: str = ""
+    token_param: str = ""
+    token_format: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +105,10 @@ class OAuthProvider:
     # perfectly well-scoped token.
     token_scopes_header: str = ""
     base_url: str = ""  # upstream API root, so a successful connect can auto-provision the tool
+    # A provider's catalog can span additional API roots. These roots are executable policy, not
+    # catalog data: a YAML `host` only selects an exact entry from this allow-list, so a catalog
+    # edit cannot redirect an injected team or platform credential to an arbitrary host.
+    catalog_targets: tuple[CatalogTarget, ...] = ()
     # Copy-paste sample calls stamped onto the provisioned tool's `examples`, surfaced by
     # `tool ls`. The single most useful thing to carry here is the API VERSION: Google's REST APIs
     # version the URL path (v25/...) and a wrong guess returns an HTML 404, not a hint — agents
@@ -151,6 +172,12 @@ class OAuthProvider:
     # protocol profile without changing the provider id or duplicating its endpoint catalog.
     authorization_methods: tuple[OAuthAuthorizationMethod, ...] = ()
     default_capability_name: str = ""
+    # Optional rollout default for a plain Connect. Keep `default_capability` as the provider's
+    # broadest semantic tier; this can point new users at a reviewed subset while wider access is
+    # still in provider review.
+    connect_default_capability_name: str = ""
+    # Method used while the semantic default method is still behind a registry review key.
+    review_fallback_authorization_method: str = ""
     # Method assigned to grants created before explicit method identity existed. Empty means the
     # provider's normal default. This keeps compatibility policy in provider metadata.
     legacy_authorization_method: str = ""
@@ -333,11 +360,47 @@ class OAuthProvider:
             return self.default_capability_name
         return max(self.capabilities, key=lambda c: len(self.scopes[c]))
 
+    @property
+    def connect_default_capability(self) -> str:
+        if self.connect_default_capability_name:
+            return self.connect_default_capability_name
+        default = self.default_capability
+        pending = get_settings().oauth_review_pending_set
+        method = self.authorization_for_capability(default)
+        if not method or not method.review_key or method.review_key not in pending:
+            return default
+        fallback = next(
+            (item for item in self.authorization_methods
+             if item.name == self.review_fallback_authorization_method),
+            None,
+        )
+        return (
+            connection_authorization.method_connect_capability(self, fallback, pending)
+            if fallback else default
+        )
+
     def authorization_for_capability(self, capability: str) -> OAuthAuthorizationMethod | None:
         return connection_authorization.method_for_capability(self, capability)
 
     def profile_for_authorization(self, method: str) -> "OAuthProvider":
         return connection_authorization.provider_profile(self, method)
+
+    def profile_for_catalog_host(self, host: str) -> "OAuthProvider":
+        """Select an explicitly approved catalog target and its credential injection profile."""
+        wanted = str(host or "").strip().lower()
+        matches = [target for target in self.catalog_targets if target.host == wanted]
+        if len(matches) != 1:
+            raise ValueError(f"catalog host {wanted!r} is not uniquely approved for {self.service}")
+        target = matches[0]
+        parsed = urlsplit(target.base_url)
+        if (parsed.scheme != "https" or parsed.netloc != wanted or parsed.hostname != wanted
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError(f"catalog target for {wanted!r} is not a safe HTTPS base URL")
+        overrides = {"base_url": target.base_url}
+        for field in ("token_location", "token_header", "token_param", "token_format"):
+            if value := getattr(target, field):
+                overrides[field] = value
+        return replace(self, **overrides)
 
     def authorization_method_name(self, stored: str) -> str:
         return connection_authorization.method_name(self, stored)
@@ -928,11 +991,21 @@ INSTAGRAM = OAuthProvider(
             "instagram_business_content_publish", "instagram_business_manage_comments",
             "instagram_business_manage_messages",
         ],
+        # The ordinary Page connection asks only for permissions that already have Advanced
+        # Access. Messaging is a separate widening step while Meta reviews that permission, so an
+        # unrelated read, publish, comment, hashtag, mention, or shopping use is never blocked by
+        # an unapproved message scope.
         "page-tools": [
             "instagram_basic", "instagram_manage_insights", "instagram_content_publish",
-            "instagram_manage_comments", "instagram_manage_messages",
+            "instagram_manage_comments",
             "instagram_shopping_tag_products", "pages_show_list", "pages_read_engagement",
-            "pages_messaging", "business_management",
+            "business_management",
+        ],
+        "page-messages": [
+            "instagram_basic", "instagram_manage_insights", "instagram_content_publish",
+            "instagram_manage_comments", "instagram_shopping_tag_products", "pages_show_list",
+            "pages_read_engagement", "business_management", "instagram_manage_messages",
+            "pages_messaging",
         ],
     },
     client_id_setting="instagram_client_id",
@@ -948,21 +1021,33 @@ INSTAGRAM = OAuthProvider(
     scope_separator=",",
     long_lived_exchange_style="instagram",
     default_capability_name="manage",
+    review_fallback_authorization_method="facebook-page",
     legacy_authorization_method="facebook-page",
     authorization_methods=(
         OAuthAuthorizationMethod(
             name="instagram-login", display_name="Instagram Login",
             capabilities=("read", "post", "manage"), connection_name="instagram",
-            description="Connect an Instagram Professional account directly. A Facebook Page is not required.",
+            description=(
+                "Connect an Instagram Professional account directly. A Facebook Page is not required."
+            ),
+            review_key="instagram-login",
+            review_notices=((
+                "instagram-login",
+                "Meta review is not complete, so this method currently works only for accounts with an app role.",
+            ),),
         ),
         OAuthAuthorizationMethod(
             name="facebook-page", display_name="Facebook Page tools",
-            capabilities=("page-tools",), connection_name="instagram-page-tools",
+            capabilities=("page-tools", "page-messages"), connection_name="instagram-page-tools",
             description=(
                 "Facebook Page tools require an Instagram Professional account that is linked "
                 "to a Facebook Page. This authorization is separate from Instagram Login."
             ),
-            connect_capability="page-tools",
+            review_notices=((
+                "page-messages",
+                "Instagram messaging is an optional permission that Meta is still reviewing.",
+            ),),
+            review_capability_rollouts=(("page-messages", "page-messages", "page-tools"),),
             action_label="Enable Facebook Page tools",
             missing_message=(
                 "This tool requires Facebook Page authorization and an Instagram Professional "
@@ -978,7 +1063,26 @@ INSTAGRAM = OAuthProvider(
                 "Read media, comments and tags that mention your account",
                 "Search the linked product catalog and inspect product appeals",
                 "Read this account's recently searched hashtags",
+            )), ("page-messages", (
+                "Read and reply to Instagram Direct messages",
+            ))),
+            capability_labels=(
+                ("page-tools", "Facebook Page tools"),
+                ("page-messages", "Facebook Page tools + messages"),
+            ),
+            capability_help=(
+                ("page-tools", (
+                    "Connect with the approved Page permissions. Instagram Direct messages are not included."
+                )),
+                ("page-messages", (
+                    "Connect with Facebook Page tools and Instagram Direct message access."
+                )),
+            ),
+            capability_review_help=(("page-messages", (
+                "Also request Instagram Direct message access. Meta review is still in progress, "
+                "so normal customer accounts might not be able to grant it yet."
             )),),
+            capability_action_labels=(("page-messages", "Enable Instagram messages"),),
             scope_aliases=(
                 ("instagram_business_basic", "instagram_basic"),
                 ("instagram_business_manage_insights", "instagram_manage_insights"),
@@ -1188,6 +1292,542 @@ HUNTER = OAuthProvider(
     base_url="https://api.hunter.io/v2",
     docs_url="https://hunter.io/api-documentation/v2",
     probe_path="/account",  # free — consumes no search/verification/enrichment credits
+)
+
+ANYAPI = OAuthProvider(
+    service="anyapi",
+    display_name="AnyAPI",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your AnyAPI key",
+    # AnyAPI accepts the key as `X-API-Key` or `Authorization: Bearer`. Use the header form so the
+    # key never lands in a URL; the query-param form does not exist here at all.
+    token_header="X-API-Key",
+    token_format="{secret}",
+    setup_url="https://getanyapi.com/dashboard",
+    setup_action_label="Get your AnyAPI key",
+    setup_steps=(
+        "Sign in at getanyapi.com/dashboard and open API keys.",
+        "Copy your key (it starts with aa_live_).",
+        "No card is needed to start: POST https://api.getanyapi.com/agent/signup returns a "
+        "free trial key with starter credit and no account at all.",
+    ),
+    setup_note=(
+        "One USD wallet, pay per request, no subscription. Every run reports its exact charge as "
+        "`costUsd`; a request that no source could serve is not charged. `GET /v1/balance` is free."
+    ),
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Social media",
+    summary=(
+        "Normalized social, search, maps, commerce and web-scrape data across 362 endpoints, "
+        "priced per request in USD with automatic failover between sources."
+    ),
+    base_url="https://api.getanyapi.com",
+    docs_url="https://getanyapi.com/docs",
+    probe_path="/v1/balance",  # free — reads the wallet, runs nothing and charges nothing
+)
+
+SUMBLE = OAuthProvider(
+    service="sumble", display_name="Sumble", auth_kind="key",
+    token_label="API key", token_placeholder="your Sumble API key",
+    token_header="Authorization", token_format="Bearer {secret}",
+    setup_url="https://sumble.com/account/api-keys",
+    setup_action_label="Get your Sumble API key",
+    setup_steps=("Sign in to Sumble and open Account → API keys.",
+                 "Create an API key and copy it before closing the dialog."),
+    setup_note="Connect your own key for the full API, including workspace lists, signals and asynchronous people requests. Connection verification uses a free technology-search miss.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find organizations, people, jobs and teams, and explore company technologies and signals.",
+    base_url="https://api.sumble.com/v9", docs_url="https://docs.sumble.com/api/api",
+    probe_path="/technologies/find", probe_method="POST",
+    probe_json={"query": "treg-nonexistent-probe-20260909"},
+    # Live 2026-09-09: bogus Bearer 401; valid key 200 with credits_used=0.
+)
+
+MOLTSETS = OAuthProvider(
+    service="moltsets", display_name="MoltSets", auth_kind="key",
+    token_label="API key", token_placeholder="ms_…",
+    token_header="Authorization", token_format="Bearer {secret}",
+    # Required on every API call as of 2026-09-16. Pin a descriptive value for connection
+    # probes and all BYOK/platform calls instead of relying on httpx's incidental default.
+    required_headers=(("User-Agent", "treg/1.0 (+https://treg.to)"),),
+    setup_url="https://app.moltsets.com/dashboard/api_keys",
+    setup_action_label="Get your MoltSets API key",
+    setup_steps=("Sign in to MoltSets and open the API Keys dashboard.",
+                 "Create an API key and copy it."),
+    setup_note="Successful data matches consume enrichment or search records; misses and connection verification are free. Phone hits also consume a phone token.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search and enrich people and companies, resolve contact details, and create audience identifiers.",
+    base_url="https://api.moltsets.com/api/v1/tools",
+    docs_url="https://docs.moltsets.com/",
+    probe_path="/get_account", probe_method="POST", probe_json={},
+    # Live 2026-09-16: bogus Bearer 401; valid key 200. Account calls consume no records.
+)
+
+OPENMART = OAuthProvider(
+    service="openmart", display_name="Openmart", auth_kind="key",
+    token_label="API key", token_placeholder="your Openmart API key",
+    token_header="Authorization", token_format="Bearer {secret}",
+    setup_url="https://app.openmart.com/",
+    setup_action_label="Get your Openmart API key",
+    setup_steps=("Sign in to Openmart and open the API settings.",
+                 "Create an API key and copy it."),
+    setup_note="Searches and enrichment consume account credits. Batch tasks can charge after submission; connection verification is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search and enrich businesses, find decision makers and contact details, and detect technologies.",
+    base_url="https://api.openmart.ai", docs_url="https://app.openmart.com/api-docs",
+    probe_path="/api/v2/credit-balance", probe_method="GET",
+    # Live 2026-09-17: missing and bogus Bearer keys returned 401; a valid key returned 200.
+)
+
+HARVESTAPI = OAuthProvider(
+    service="harvestapi", display_name="HarvestAPI", auth_kind="key",
+    token_label="API key", token_placeholder="your HarvestAPI API key",
+    token_header="X-API-Key", token_format="{secret}",
+    setup_url="https://harvestapi.io/",
+    setup_action_label="Get your HarvestAPI API key",
+    setup_steps=("Sign in to HarvestAPI and open Dashboard → API keys.",
+                 "Create an API key and paste it here."),
+    setup_note="LinkedIn data and enrichment using an API key. Connection verification is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Retrieve LinkedIn profiles, companies, jobs, posts and ads, and find leads and emails.",
+    base_url="https://api.harvestapi.io", docs_url="https://docs.harvestapi.io",
+    probe_path="/users/my-api-user",  # Internal only; live bad key 401, valid key 200.
+)
+
+DROPLEADS = OAuthProvider(
+    service="dropleads", display_name="Dropleads", auth_kind="key",
+    token_label="API key", token_placeholder="your Dropleads API key",
+    token_header="X-API-Key", token_format="{secret}",
+    setup_url="https://app.dropleads.io/",
+    setup_action_label="Get your Dropleads API key",
+    setup_steps=("Sign in to Dropleads and open the API section.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("People and company searches, enrichment, email finding and verification, and "
+                "mobile finding share the account's credit balance. Connection verification is free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search and enrich people and companies, find work emails and mobiles, and verify emails.",
+    base_url="https://prime.dropleads.io",
+    docs_url="https://dropleads.readme.io/",
+    probe_path="/api/v2/prime-db/credits/balance",
+    catalog_targets=(
+        CatalogTarget(host="api.dropleads.io", base_url="https://api.dropleads.io"),
+    ),
+    extra_tools=(
+        {"suffix": "contact",
+         "base_url": "https://api.dropleads.io",
+         "examples": [
+             {"method": "POST", "path": "/email-finder",
+              "note": "Find a work email from first_name, last_name and company_domain or company_name."},
+             {"method": "POST", "path": "/mobile-finder",
+              "note": "Find a mobile number from linkedin_url."},
+             {"method": "POST", "path": "/email-verifier",
+              "note": "Verify one email address."},
+         ]},
+    ),
+)
+
+QUICKENRICH = OAuthProvider(
+    service="quickenrich", display_name="QuickEnrich", auth_kind="key",
+    token_label="API key", token_placeholder="your QuickEnrich API key",
+    token_header="Authorization", token_format="Bearer {secret}",
+    setup_url="https://app.quickenrich.io/docs",
+    setup_action_label="Get your QuickEnrich API key",
+    setup_steps=("Sign in to QuickEnrich and copy your API key.",
+                 "If no key is available, contact QuickEnrich support as described in its API docs."),
+    setup_note="Free contact discovery, then selective email or phone enrichment. Free, Starter and Growth API credits reset monthly; GTM Unlimited includes unlimited API credits. Connection verification is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Discover business contacts for free, find emails and phones, and search companies.",
+    base_url="https://app.quickenrich.io", docs_url="https://app.quickenrich.io/docs",
+    probe_path="/api/employees/contact-finder", probe_method="POST",
+    probe_json={"company_url": {"include": ["treg-probe-nonexistent.invalid"], "exclude": []}, "per_page": 1},
+    # Live 2026-09-08: bad key 401; valid free key 200, credits_used=0.
+)
+
+PROSPEO = OAuthProvider(
+    service="prospeo", display_name="Prospeo", auth_kind="key",
+    token_label="API key", token_placeholder="your Prospeo API key",
+    token_header="X-KEY", token_format="{secret}",
+    setup_url="https://app.prospeo.io/",
+    setup_action_label="Get your Prospeo API key",
+    setup_steps=("Sign in to Prospeo and open the API key settings.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("People and company search and enrichment share the account's monthly credits. "
+                "Connection verification reads account information for free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search and enrich people and companies, including verified work emails and mobiles.",
+    base_url="https://api.prospeo.io", docs_url="https://prospeo.io/api-docs",
+    # Live 2026-09-16: GET returned 200 for the platform key and 400 INVALID_API_KEY for garbage.
+    # The same free route is the capacity collector; Prospeo's data routes are POST, this one is GET.
+    probe_path="/account-information", probe_method="GET",
+)
+
+AIARK = OAuthProvider(
+    service="aiark", display_name="AI Ark", auth_kind="key",
+    token_label="API key", token_placeholder="your AI Ark API key",
+    token_header="X-TOKEN", token_format="{secret}",
+    setup_url="https://app.ai-ark.com/settings/api-management/dashboard",
+    setup_action_label="Get your AI Ark API key",
+    setup_steps=("Sign in to AI Ark and open the API Management dashboard.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("Search and synchronous enrichment use monthly credits. Connection verification "
+                "reads the remaining balance for free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search people and companies, find verified emails and mobiles, and enrich profiles.",
+    base_url="https://api.ai-ark.com/api/developer-portal",
+    docs_url="https://docs.ai-ark.com/",
+    # Live 2026-09-17: missing and bogus keys returned 401; the assigned key returned 200.
+    probe_path="/v1/payments/credits", probe_method="GET",
+)
+
+WIZA = OAuthProvider(
+    service="wiza", display_name="Wiza", auth_kind="key",
+    token_label="API key", token_placeholder="your Wiza API key",
+    token_header="Authorization", token_format="Bearer {secret}",
+    setup_url="https://wiza.co/app/settings/api",
+    setup_action_label="Get your Wiza API key",
+    setup_steps=("Sign in to Wiza and open Settings → API.",
+                 "Generate or copy an API key and paste it here."),
+    setup_note=("Search and enrich people and companies with prepaid API credits. "
+                "Connection verification reads the API credit balance for free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search professional profiles and companies, enrich company data, and run contact reveal jobs.",
+    base_url="https://wiza.co", docs_url="https://docs.wiza.co/",
+    # Live 2026-09-16: a bogus Bearer key returned 401; the assigned key returned 200.
+    # This route is internal and is also the free capacity collector.
+    probe_path="/api/meta/credits", probe_method="GET",
+)
+
+LIMADATA = OAuthProvider(
+    service="limadata", display_name="LimaData", auth_kind="key",
+    token_label="API key", token_placeholder="your LimaData API key",
+    token_header="x-api-key", token_format="{secret}",
+    setup_url="https://app.limadata.com/",
+    setup_action_label="Get your LimaData API key",
+    setup_steps=("Sign in to LimaData and open the API key settings.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("Search, enrichment, contact lookup and research use one credit balance. "
+                "Connection verification sends an invalid empty search request, which costs no credits."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Enrich people and companies, find contact details, search a B2B database, and research the web.",
+    base_url="https://api.limadata.com", docs_url="https://api.limadata.com/docs/basic_v2",
+    # Live 2026-09-17: POST with {} is a free 400 for the assigned key and 401 for a bogus key.
+    probe_path="/api/v1/search/web", probe_method="POST", probe_json={},
+    probe_reject_statuses=(401, 403),
+)
+
+GETLEADSIO = OAuthProvider(
+    service="getleadsio", display_name="GetLeads.io", auth_kind="key",
+    token_label="API key", token_placeholder="your GetLeads.io API key",
+    token_header="Authorization", token_format="Bearer {secret}",
+    setup_url="https://app.getleads.io/",
+    setup_action_label="Get your GetLeads.io API key",
+    setup_steps=("Sign in to GetLeads.io and open the API-key settings.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("Search, enrichment and lookups use plan credits. Connection verification reads "
+                "the fair-use and remaining-credit status for free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search a business-contact database, enrich people, and find company contacts and signals.",
+    base_url="https://app.getleads.io", docs_url="https://www.getleads.io/docs/",
+    # Live 2026-09-16: bogus Bearer 401; valid key 200; the documented route costs zero credits.
+    probe_path="/api/v1/usage/fair-use", probe_method="GET",
+)
+
+SCRUBBY = OAuthProvider(
+    service="scrubby", display_name="Scrubby", auth_kind="key",
+    token_label="API key", token_placeholder="your Scrubby API key",
+    token_header="x-api-key", token_format="{secret}",
+    # Live: Scrubby's edge rejected Python's default urllib User-Agent before the request reached
+    # the API. Pin a descriptive value for probes and all BYOK/platform calls; required_headers
+    # intentionally overwrites any caller-supplied User-Agent.
+    required_headers=(("User-Agent", "treg/1.0 (+https://treg.to)"),),
+    setup_url="https://app.scrubby.io/",
+    setup_action_label="Get your Scrubby API key",
+    setup_steps=("Sign in to Scrubby and open the API settings.",
+                 "Copy your API key and paste it here."),
+    setup_note=("Quick verification costs one credit per fresh address; deep verification costs "
+                "three. Connection verification uses a free nonexistent-result lookup."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Verify email deliverability with quick or 72-hour deep verification.",
+    base_url="https://api.scrubby.io", docs_url="https://docs.scrubby.io/",
+    probe_path="/fetch_bulk_results", probe_method="POST",
+    probe_json={"identifier": "treg-probe-not-found"},
+    token_ok_field="detail",
+    token_ok_value="No results found for this identifier.",
+    probe_reject_statuses=(401, 403),
+)
+
+ZEROBOUNCE = OAuthProvider(
+    service="zerobounce", display_name="ZeroBounce", auth_kind="key",
+    token_label="API key", token_placeholder="your ZeroBounce API key",
+    token_location="query", token_param="api_key", token_format="{secret}",
+    setup_url="https://www.zerobounce.net/members/api",
+    setup_action_label="Get your ZeroBounce API key",
+    setup_steps=("Sign in to ZeroBounce and open the API section.",
+                 "Create or copy an API key and paste it here."),
+    setup_note=("Single email validation uses one credit for a non-unknown result. Unknown results "
+                "are not charged. Connection verification reads API usage for free."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Verify email deliverability and inspect validation usage and credit balance.",
+    base_url="https://api.zerobounce.net",
+    docs_url="https://www.zerobounce.net/docs/email-validation-api-quickstart",
+    # Live 2026-09-17: no/bogus key returned 403; the assigned key returned 200. Use usage rather
+    # than getcredits for connection verification because getcredits reports a bad key as the
+    # HTTP-200 sentinel {"Credits": -1}. Dates are a valid closed historical range.
+    probe_path="/v2/getapiusage?start_date=2026-01-01&end_date=2026-12-31",
+)
+
+DATAGMA = OAuthProvider(
+    service="datagma", display_name="Datagma", auth_kind="key",
+    token_label="API ID", token_placeholder="your Datagma API ID",
+    token_location="query", token_param="apiId", token_format="{secret}",
+    setup_url="https://app.datagma.com/user-api",
+    setup_action_label="Get your Datagma API ID",
+    setup_steps=("Sign in to Datagma and open the API page.",
+                 "Copy your API ID and paste it here."),
+    setup_note=("Person, company, email, phone and job-change lookups use prepaid credits. "
+                "Connection verification reads the balance internally and exposes no account details."),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find work emails and mobile numbers, enrich people and companies, and detect job changes.",
+    base_url="https://gateway.datagma.net",
+    docs_url="https://datagmaapi.readme.io/reference/getting-started-with-your-api",
+    # Live 2026-09-18: the assigned key returned 200 and a bogus key returned 401. This free
+    # account route remains internal; catalog callers never receive its account payload.
+    probe_path="/api/ingress/v1/mine", probe_method="GET",
+)
+
+TRYKITT = OAuthProvider(
+    service="trykitt",
+    display_name="Kitt AI",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your Kitt AI API key",
+    token_header="x-api-key",
+    token_format="{secret}",
+    setup_url="https://admin.trykitt.ai/",
+    setup_action_label="Get your Kitt AI API key",
+    setup_steps=("Sign in to Kitt AI and open API Key in the sidebar.", "Copy your API key."),
+    setup_note="Find verified work emails or verify an existing address. Free API access has variable capacity; PAYG charges per found email and per verification, including unknown/catchall results.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find verified work emails and verify email deliverability, including catch-all addresses.",
+    base_url="https://api.trykitt.ai",
+    docs_url="https://documenter.getpostman.com/view/479833/2s93m62NHf",
+    probe_path="/credit",  # Live: valid zero balance is 200; garbage key is 401.
+)
+
+CONTACTOUT = OAuthProvider(
+    service="contactout", display_name="ContactOut", auth_kind="key",
+    token_label="API token", token_placeholder="your ContactOut API token",
+    token_header="token", token_format="{secret}",
+    setup_url="https://contactout.com/meeting",
+    setup_action_label="Get your ContactOut API token",
+    setup_steps=("Request API access from ContactOut and copy your API token.",),
+    setup_note="Your own key is billed by ContactOut, never metered by treg. Connection checks use the account stats endpoint.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find work emails, personal emails and phones from LinkedIn; search people and companies.",
+    base_url="https://api.contactout.com", docs_url="https://api.contactout.com/",
+    probe_path="/v1/stats", token_ok_field="status_code", token_ok_value="200",
+    # Live: garbage token returns HTTP 401; the supplied platform token returns 200.
+)
+
+MILLIONVERIFIER = OAuthProvider(
+    service="millionverifier",
+    display_name="MillionVerifier",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your MillionVerifier API key",
+    token_location="query",
+    token_param="api",
+    token_format="{secret}",
+    setup_url="https://app.millionverifier.com/api",
+    setup_action_label="Get your MillionVerifier API key",
+    setup_steps=(
+        "Sign in to MillionVerifier and open Account settings → API Keys.",
+        "Add an API key if needed, make sure it is active, and copy it.",
+    ),
+    setup_note="Prepaid credits never expire. Risky (unknown and catch-all) results receive automatic credit returns for eligible accounts; the credits check is free.",
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Verify email deliverability and identify catch-all, disposable and role addresses.",
+    base_url="https://api.millionverifier.com",
+    docs_url="https://developer.millionverifier.com/",
+    probe_path="/api/v3/credits",
+    # Live 2026-09-08: HTTP 200 {result: error, error: apikey_not_found} for a garbage key.
+    # Do not require a truthy credits balance: a valid exhausted account can still connect.
+    token_reject_field="error",
+)
+
+BOUNCEBAN = OAuthProvider(
+    service="bounceban",
+    display_name="BounceBan",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your BounceBan API key",
+    token_header="Authorization",
+    token_format="{secret}",
+    setup_url="https://bounceban.com/app/api/settings",
+    setup_action_label="Get your BounceBan API key",
+    setup_steps=(
+        "Sign in to BounceBan and open API settings.",
+        "Create or copy an API key and paste it here.",
+    ),
+    setup_note=("Each completed API verification normally uses one prepaid credit. "
+                "The free account probe checks the verification-credit balance."),
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Verify email deliverability, including catch-all and protected mailboxes.",
+    base_url="https://api.bounceban.com",
+    docs_url="https://bounceban.com/public/doc/api.html",
+    probe_path="/v1/account",
+    catalog_targets=(
+        CatalogTarget(host="api-waterfall.bounceban.com",
+                      base_url="https://api-waterfall.bounceban.com"),
+    ),
+    extra_tools=(
+        {"suffix": "waterfall", "base_url": "https://api-waterfall.bounceban.com",
+         "examples": [{"method": "GET", "path": "/v1/verify/single",
+                       "note": "Wait for one email verification result; BYOK only in the catalog."}]},
+    ),
+)
+
+MINIMAX = OAuthProvider(
+    service="minimax",
+    display_name="MiniMax",
+    auth_kind="token",
+    token_label="API key",
+    token_placeholder="your MiniMax API key",
+    setup_url="https://platform.minimax.io/user-center/basic-information/interface-key",
+    setup_action_label="Get your MiniMax API key",
+    setup_steps=(
+        "Sign in to the MiniMax international platform and open API Keys.",
+        "Create a key and copy it.",
+    ),
+    setup_note="Generation calls are paid; the empty validation probe does not create content.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="AI generation",
+    summary="Generate voice, images, and videos from text or source images.",
+    base_url="https://api.minimax.io",
+    docs_url="https://platform.minimax.io/docs/api-reference/api-overview",
+    probe_path="/v2/video_generation",
+    probe_method="POST",
+    probe_json={},
+    probe_reject_statuses=(401, 403),
+)
+
+OPENROUTER = OAuthProvider(
+    service="openrouter",
+    display_name="OpenRouter",
+    auth_kind="token",
+    token_label="API key",
+    token_placeholder="your OpenRouter API key",
+    setup_url="https://openrouter.ai/settings/keys",
+    setup_action_label="Get your OpenRouter API key",
+    setup_steps=(
+        "Sign in to OpenRouter and open API Keys.",
+        "Create a key and copy it.",
+    ),
+    setup_note="Model calls spend OpenRouter credits; the key-info probe is free.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="AI generation",
+    summary="Generate video across many hosted models through one API.",
+    base_url="https://openrouter.ai/api/v1",
+    docs_url="https://openrouter.ai/docs/guides/overview/multimodal/video-generation",
+    probe_path="/key",
+)
+
+REPLICATE = OAuthProvider(
+    service="replicate",
+    display_name="Replicate",
+    auth_kind="token",
+    token_label="API token",
+    token_placeholder="your Replicate API token",
+    setup_url="https://replicate.com/account/api-tokens",
+    setup_action_label="Get your Replicate API token",
+    setup_steps=(
+        "Sign in to Replicate and open API tokens.",
+        "Copy the default token or create a new token.",
+    ),
+    setup_note="Predictions are paid; the account probe does not run a model.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="AI generation",
+    summary="Run official image and video generation models with a stable prediction API.",
+    base_url="https://api.replicate.com/v1",
+    docs_url="https://replicate.com/docs/reference/http",
+    probe_path="/account",
+)
+
+REAPI = OAuthProvider(
+    service="reapi",
+    display_name="reAPI",
+    auth_kind="token",
+    token_label="API key",
+    token_placeholder="your reAPI API key",
+    setup_url="https://reapi.ai/dashboard/api-keys",
+    setup_action_label="Get your reAPI API key",
+    setup_steps=(
+        "Sign in to reAPI and open Dashboard → API Keys.",
+        "Create a key and copy it (it is shown once).",
+    ),
+    setup_note="Generations spend prepaid credits (1 credit = $0.001); the task probe is free.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="AI generation",
+    summary="Generate Seedance 2.5 video (with a relaxed content filter) and GPT Image / Gemini images through one async API.",
+    base_url="https://reapi.ai/api/v1",
+    docs_url="https://reapi.ai/docs",
+    # No free account route: a valid key answers the unknown task id with 404, a bad one with 401
+    # ({"error":{"code":10003,"message":"Invalid API key."}}, observed 2026-09-14).
+    probe_path="/tasks/probe",
+    probe_reject_statuses=(401, 403),
+)
+
+PIAPI = OAuthProvider(
+    service="piapi",
+    display_name="PiAPI",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your PiAPI API key",
+    token_header="X-API-Key",
+    token_format="{secret}",
+    setup_url="https://piapi.ai/workspace/key",
+    setup_action_label="Get your PiAPI API key",
+    setup_steps=(
+        "Sign in to PiAPI and open the workspace API key page.",
+        "Copy your API key.",
+    ),
+    setup_note="Generations are paid per task; the account-info probe is free.",
+    auth_uri="", token_uri="", scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="AI generation",
+    summary="Generate Seedance 2.5 video (default or less-restriction) and Nano Banana Pro / GPT Image images through one task API.",
+    base_url="https://api.piapi.ai",
+    docs_url="https://piapi.ai/docs/overview",
+    probe_path="/account/info",  # free; a bad key answers 401 {"message":"Failed to verify api key"}
 )
 
 TIKHUB = OAuthProvider(
@@ -1555,7 +2195,7 @@ DIFFBOT = OAuthProvider(
     auth_kind="key",
     token_label="API token",
     token_placeholder="your Diffbot token",
-    token_location="query",  # token is a query param on every call
+    token_location="query",  # normal Diffbot calls use ?token=; Web Search overrides this below
     token_param="token",
     token_format="{secret}",
     setup_url="https://app.diffbot.com/get-started/",
@@ -1569,6 +2209,14 @@ DIFFBOT = OAuthProvider(
     # Enhance/enrich + DQL live on the KG host; the free account probe lives on the api host, so verify
     # off-host. The provisioned tool points at the KG host (the enrichment value).
     base_url="https://kg.diffbot.com/kg/v3",
+    catalog_targets=(
+        CatalogTarget(host="api.diffbot.com", base_url="https://api.diffbot.com"),
+        CatalogTarget(
+            host="llm.diffbot.com", base_url="https://llm.diffbot.com",
+            token_location="header", token_header="Authorization", token_format="Bearer {secret}",
+        ),
+        CatalogTarget(host="nl.diffbot.com", base_url="https://nl.diffbot.com"),
+    ),
     docs_url="https://docs.diffbot.com/reference/authentication",
     probe_url="https://api.diffbot.com/v4/account",  # token injected as ?token=…
 )
@@ -1766,6 +2414,45 @@ LITESCRAPE = OAuthProvider(
     base_url="https://api.litescrape.com",
     docs_url="https://litescrape.com/docs",
     probe_path="/api/keys/status",  # free balance/rate-card snapshot; 401 on a bad key
+)
+
+CLORO = OAuthProvider(
+    service="cloro",
+    display_name="cloro",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="sk_live_…",
+    # cloro reads the key from Authorization. It accepts "Bearer <key>", "ApiKey <key>" and the bare
+    # key; Bearer is the documented form, so that is the one treg sends. Header, so the key never
+    # lands in a logged URL. Keys are `sk_live_` / `sk_test_` + 32 hex characters.
+    setup_url="https://dashboard.cloro.dev",
+    setup_action_label="Get your cloro API key",
+    setup_steps=(
+        "Sign in to the cloro dashboard and open API keys.",
+        "Create a key and copy it — the full key is shown only once.",
+    ),
+    setup_note=(
+        "Every monitor call spends credits from your cloro balance (Google 5, AI Mode / Gemini / "
+        "Perplexity 6, ChatGPT / Copilot 7, each including the +2 sync surcharge; optional "
+        "include flags and US state targeting add more). The free plan grants 500 credits a "
+        "month. Connecting spends nothing — the probe is the free credit-balance route."
+    ),
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="SEO",
+    summary=(
+        "Ask ChatGPT, Gemini, Copilot, Perplexity and Google AI Mode a prompt from any country and "
+        "read the answer, its cited sources and its shopping cards as structured data — plus "
+        "Google Search and Google News SERPs."
+    ),
+    base_url="https://api.cloro.dev",
+    docs_url="https://cloro.dev/docs/api-reference/introduction",
+    # Credit balance: free, charges nothing, and separates a bad key from a good one distinctly.
+    # A well-formed but unknown key answers 401 INVALID_OR_EXPIRED_API_KEY, a malformed one 401
+    # INVALID_API_KEY_FORMAT, and no header at all 401 MISSING_API_KEY (all verified live
+    # 2026-09-05). A valid key answers 200 with the balance.
+    probe_path="/v1/credits",
 )
 
 
@@ -2370,6 +3057,48 @@ TIINGO = OAuthProvider(
 )
 
 
+FINANCIALDATASETS = OAuthProvider(
+    service="financialdatasets",
+    display_name="Financial Datasets",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your Financial Datasets API key",
+    token_header="X-API-KEY",
+    token_format="{secret}",
+    setup_url="https://www.financialdatasets.ai/",
+    setup_action_label="Get your Financial Datasets API key",
+    setup_steps=(
+        "Create or sign in to a Financial Datasets account.",
+        "Open the dashboard, create an API key, and copy it.",
+    ),
+    setup_note=(
+        "Financial Datasets uses prepaid Credits. Connecting checks one real-time US stock "
+        "snapshot, which is listed at $0.02; an empty-Credits 402 still proves the key is valid."
+    ),
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Market data",
+    summary=(
+        "US public-company financial statements, metrics, filings, ownership, earnings, news "
+        "and stock prices, plus major-central-bank interest rates."
+    ),
+    base_url="https://api.financialdatasets.ai",
+    docs_url="https://docs.financialdatasets.ai/",
+    # Discovery helpers accept anonymous requests and cannot validate a pasted key. A snapshot is
+    # the smallest authenticated data request. Keep this absolute and probe_path empty: connect-time
+    # verification only, with no recurring health check saved onto the provisioned tool.
+    probe_url="https://api.financialdatasets.ai/prices/snapshot?ticker=AAPL",
+    probe_path="",
+    # 402 means the key was accepted but its prepaid Credits are empty. Use the existing reject-list
+    # metadata to accept exactly the two observed valid-key outcomes, without changing shared probe
+    # behavior or the recurring health-check schema.
+    probe_reject_statuses=tuple(
+        status for status in range(100, 600) if status not in (200, 402)
+    ),
+)
+
+
 # Alpha Vantage is DELIBERATELY absent. Its API served real quote data to a garbage key (verified
 # live 2026-08-14: bogus key -> HTTP 200 with the IBM quote; even premium endpoints answer 200 with
 # an upsell note), so a pasted key can never be validated at connect — the ScrapeCreators rule:
@@ -2568,16 +3297,22 @@ REGISTRY: dict[str, OAuthProvider] = {
         GOOGLE_ADS, YOUTUBE,
         LINKEDIN, SLACK, X, TIKTOK, FACEBOOK, INSTAGRAM, META_ADS,
         # API-key providers
-        APOLLO, PDL, AKTA, HUNTER, CRUNCHBASE, TIKHUB, BRIGHTDATA, SEMRUSH, JUSTONEAPI,
+        ANYAPI, APOLLO, PDL, AKTA, HUNTER, SUMBLE, MOLTSETS, OPENMART, HARVESTAPI, DROPLEADS,
+        QUICKENRICH, PROSPEO, AIARK, WIZA, LIMADATA, GETLEADSIO, SCRUBBY, ZEROBOUNCE, DATAGMA,
+        TRYKITT, CONTACTOUT, MILLIONVERIFIER, BOUNCEBAN, CRUNCHBASE, MINIMAX, OPENROUTER,
+        REPLICATE,
+        REAPI, PIAPI,
+        TIKHUB, BRIGHTDATA, SEMRUSH, JUSTONEAPI,
         SCRAPECREATORS,
         # SEO API-key providers
-        DATAFORSEO, SERANKING, MOZ, MAJESTIC, SERPSTAT, EXA, LITESCRAPE,
+        DATAFORSEO, SERANKING, MOZ, MAJESTIC, SERPSTAT, EXA, LITESCRAPE, CLORO,
         # more Enrichment API-key providers
         LUSHA, CORESIGNAL, DIFFBOT, THECOMPANIESAPI, LEADMAGIC, FIBER_AI, CRUSTDATA, AVIATO,
         COMPANYENRICH, OCEANIO, TOMBA, PREDICTLEADS, FINDYMAIL, BRANDDEV, ICYPEAS, LEADSFORGE,
         INFLUENCERSCLUB,
         # Market data API-key providers
         COINGECKO, POLYGON, FINNHUB, TWELVEDATA, FMP, EODHD, MARKETSTACK, TIINGO,
+        FINANCIALDATASETS,
         # Advertising: API-key ad intelligence + unconfigured OAuth ad platforms
         SPYFU, APIFY, META_AD_LIBRARY, SERPAPI,
         MICROSOFT_ADS, SNAPCHAT_ADS, TIKTOK_ADS, PINTEREST_ADS,
@@ -2588,7 +3323,8 @@ DEFAULT_CAPABILITY = "read"
 
 # Shelf order in the marketplace. Anything carrying a category not named here sorts last, so a
 # provider added without one is visible rather than lost between the shelves.
-CATEGORY_ORDER = ("SEO", "Advertising", "Social media", "Enrichment", "Market data", "Community", "Other")
+CATEGORY_ORDER = ("AI generation", "SEO", "Advertising", "Social media", "Enrichment",
+                  "Market data", "Community", "Other")
 
 
 def get(service: str) -> OAuthProvider | None:
@@ -2736,6 +3472,44 @@ def scope_label(scope: str) -> str:
 
 def listing() -> list[dict]:
     """Every known provider, flagged with whether this deployment can actually run its flow."""
+    pending_reviews = get_settings().oauth_review_pending_set
+
+    def method_listing(provider: OAuthProvider, method: OAuthAuthorizationMethod) -> dict:
+        labels, intros, details = connection_authorization.capability_presentation(
+            method, pending_reviews,
+        )
+        return {
+            "name": method.name,
+            "display_name": method.display_name,
+            "in_review": bool(method.review_key and method.review_key in pending_reviews),
+            "capabilities_in_review": [
+                capability
+                for key, capability, _fallback in method.review_capability_rollouts
+                if key in pending_reviews
+            ],
+            "capabilities": list(connection_authorization.connect_capabilities(
+                method, pending_reviews,
+            )),
+            "description": connection_authorization.description(method, pending_reviews),
+            "connect_capability": connection_authorization.method_connect_capability(
+                provider, method, pending_reviews,
+            ),
+            "action_label": method.action_label,
+            "missing_message": method.missing_message,
+            "capability_intros": intros,
+            "capability_details": details,
+            "capability_labels": labels,
+            "capability_help": {
+                capability: connection_authorization.capability_help(
+                    method, capability, pending_reviews,
+                )
+                for capability in method.capabilities
+            },
+            "capability_action_labels": dict(method.capability_action_labels),
+            "configured": is_configured(provider.profile_for_authorization(method.name)),
+            "consent_notice": provider.profile_for_authorization(method.name).consent_notice,
+        }
+
     return [
         {
             "service": p.service,
@@ -2749,7 +3523,11 @@ def listing() -> list[dict]:
                 for cap, scopes in sorted(p.scopes.items())
             },
             "capabilities": p.capabilities,
+            "permission_capabilities": list(
+                connection_authorization.permission_capabilities(p, pending_reviews)
+            ),
             "default_capability": p.default_capability,
+            "connect_default_capability": p.connect_default_capability,
             "resource_label": p.resource_label,
             "resource_plural": p.resource_plural,
             "supports_discovery": p.supports_discovery,
@@ -2768,25 +3546,7 @@ def listing() -> list[dict]:
             "docs_url": p.docs_url,
             "consent_notice": p.consent_notice,
             "configured": is_configured(p),
-            "authorization_methods": [
-                {
-                    "name": method.name,
-                    "display_name": method.display_name,
-                    "capabilities": list(method.capabilities),
-                    "description": method.description,
-                    "connect_capability": method.connect_capability,
-                    "action_label": method.action_label,
-                    "missing_message": method.missing_message,
-                    "capability_intros": dict(method.capability_intros),
-                    "capability_details": {
-                        capability: list(details)
-                        for capability, details in method.capability_details
-                    },
-                    "configured": is_configured(p.profile_for_authorization(method.name)),
-                    "consent_notice": p.profile_for_authorization(method.name).consent_notice,
-                }
-                for method in p.authorization_methods
-            ],
+            "authorization_methods": [method_listing(p, method) for method in p.authorization_methods],
             # Whether calls on this connection are metered from the team balance (the provider
             # bills treg's app per use), with the default rates — shown BEFORE consent, so nobody
             # connects an account without seeing the price. Off unless the deployment enables it.

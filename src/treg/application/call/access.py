@@ -6,6 +6,8 @@ platform service tiers satisfy an endpoint.
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ... import oauth_providers
@@ -16,7 +18,9 @@ from ...domain.connections import authorization as connection_authorization
 from ...domain.identity.access import Caller
 from .resolve import (
     _authorization_method,
+    _anonymous_offer,
     _enforce_catalog_status,
+    _marketplace_pricing,
     _marketplace_secret,
     _platform_estimate_micro,
     _platform_offer,
@@ -63,7 +67,9 @@ async def catalog_endpoint_access(
 
     if methods:
         try:
-            grant = await _provider_tool_grant(service, methods, caller, db)
+            grant = await _provider_tool_grant(
+                service, methods, caller, db, endpoint=endpoint,
+            )
         except CallFailure as exc:
             if exc.status_code == 403:
                 return {
@@ -74,7 +80,16 @@ async def catalog_endpoint_access(
                 }
             raise
         if grant is not None:
-            tool, _, grant_method = grant
+            tool, secret, grant_method = grant
+            specification = connection_authorization.method_spec(
+                registry_provider, grant_method,
+            )
+            required = connection_authorization.required_scopes(endpoint, specification)
+            if any(scope not in secret.granted_scopes.split() for scope in required):
+                return _missing_access(
+                    endpoint, registry_provider, provider, (grant_method,), service,
+                    existing=True,
+                )
             return {
                 "tier": "tool",
                 "authorization_method": grant_method,
@@ -94,19 +109,53 @@ async def catalog_endpoint_access(
         if direct is not None:
             return direct
 
+    anonymous = _anonymous_offer(endpoint, caller.org)
+    if anonymous is not None:
+        return {
+            "tier": "anonymous",
+            "metered": False,
+            "detail": "no provider key needed — the verified public upstream route is free",
+            "estimated_cost_micro": 0,
+            "estimated_cost_usd": 0,
+        }
+
     cost = _platform_offer(endpoint, provider, caller.org)
     if cost is not None:
-        estimate = _platform_estimate_micro(cost, {})
+        # The number is the honest per-call price at the DEFAULT page size — a `per_result`
+        # endpoint costs more or less depending on how many rows the caller asks for, so it is "~".
+        estimate = _platform_access_estimate(endpoint, service, cost)
+        low = cost.get("usd_min")  # a price table: the figure depends on model/resolution/duration
+        if isinstance(low, (int, float)) and low < ledger.usd(estimate):
+            price = (f"${low:g}-${ledger.usd(estimate):g} by model, resolution and duration (the "
+                     f"matching rate-card row is held; you pay the provider's reported cost, which "
+                     f"can exceed it)" if cost.get("settle") == "usage" else
+                     f"${low:g}-${ledger.usd(estimate):g} by model, resolution and duration (reserved "
+                     f"at the table row your request matches)")
+        else:
+            price = f"~${ledger.usd(estimate):g}/call"
         return {
             "tier": "platform",
-            "detail": (
-                f"no key needed — uses treg's {service} key, "
-                f"~${ledger.usd(estimate):g}/call from your team balance (treg balance)"
-            ),
+            "detail": (f"no key needed — uses treg's {service} key, {price} "
+                       f"from your team balance (treg balance)"),
             "estimated_cost_micro": estimate,
             "estimated_cost_usd": ledger.usd(estimate),
+            **({"estimated_cost_usd_min": low} if isinstance(low, (int, float)) else {}),
         }
     return _missing_access(endpoint, registry_provider, provider, methods, service)
+
+
+def _platform_access_estimate(endpoint: dict, service: str, cost: dict) -> int:
+    """Estimate the catalog's runnable example, including provider-specific request pricing."""
+    if service != "openmart":
+        return _platform_estimate_micro(cost, {})
+    test_request = endpoint.get("test_request") or {}
+    body_value = test_request.get("body")
+    body = json.dumps(body_value).encode() if body_value is not None else b""
+    query = dict(test_request.get("query") or {})
+    estimate, _unit = _marketplace_pricing(
+        service, endpoint["id"], cost, query, body,
+    )
+    return estimate
 
 
 async def _routed_access(endpoint: dict, caller: Caller, catalog) -> dict:
@@ -135,6 +184,7 @@ async def _routed_access(endpoint: dict, caller: Caller, catalog) -> dict:
     how = (
         "your registered tool" if first.tier == "tool" else
         "your own credential" if first.tier == "credential" else
+        "a verified public upstream route, no provider key" if first.tier == "anonymous" else
         f"treg's {first.endpoint['provider']} key, ~${(first.price_micro or 0) / 1e6:g}"
     )
     dropped_note = ""
@@ -203,11 +253,14 @@ async def _direct_access(
 
 def _missing_access(
     endpoint: dict, registry_provider, provider, methods: tuple[str, ...], service: str,
+    *, existing: bool = False,
 ) -> dict:
     specification = (
         connection_authorization.method_spec(registry_provider, methods[0]) if methods else None
     )
-    capability = specification.connect_capability if specification else ""
+    capability = connection_authorization.connect_capability(
+        registry_provider, endpoint, specification,
+    )
     connect = f"treg connections connect --provider {service}"
     if capability:
         connect += f" --capability {capability}"
@@ -215,12 +268,19 @@ def _missing_access(
         f"connect with: {connect}" if not provider.uses_pasted_secret else
         f"connect with: {connect}, or treg secret add {service} …"
     )
+    detail = (
+        f"the connected {service} authorization needs more access — reconnect with: {connect}"
+        if existing else f"no {service} credential in this org yet — {hint}"
+    )
     return {
         "tier": "none",
         "authorization_method": methods[0] if methods else "",
         "connect_capability": capability,
         "connect_command": connect,
-        "action_label": specification.action_label if specification else "",
+        "action_label": (
+            connection_authorization.action_label(specification, capability)
+            if specification else ""
+        ),
         "missing_message": specification.missing_message if specification else "",
-        "detail": f"no {service} credential in this org yet — {hint}",
+        "detail": detail,
     }

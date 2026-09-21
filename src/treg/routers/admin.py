@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import logging
@@ -16,7 +17,8 @@ from sqlmodel import select
 
 from .. import reconcile
 from ..config import get_settings
-from ..infra.db import get_session, session_maker
+from ..infra import kv
+from ..infra.db import background_session_maker, get_admin_session
 from ..domain import money
 from ..models import ArchiveEndpointStat, ArchiveKey, ArchiveSnapshot, Bundle, CallRecord, LedgerEntry, Membership, Org, Referral, Secret, Tool, User
 from ..timeutil import as_naive as _as_naive
@@ -38,7 +40,7 @@ def _tally(items) -> dict:
 
 
 @app.get("/admin/stats")
-async def admin_stats(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)) -> dict:
+async def admin_stats(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)) -> dict:
     async def n(model) -> int:
         return (await db.execute(select(func.count()).select_from(model))).scalar() or 0
 
@@ -91,7 +93,7 @@ async def admin_stats(_: str = Depends(require_superadmin), db: AsyncSession = D
 
 
 @app.get("/admin/orgs")
-async def admin_orgs(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)) -> list[dict]:
+async def admin_orgs(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)) -> list[dict]:
     orgs = (await db.execute(select(Org))).scalars().all()
 
     async def _counts(model) -> dict[int, int]:  # one grouped COUNT instead of one-per-org (was O(orgs) queries)
@@ -116,7 +118,7 @@ async def admin_orgs(_: str = Depends(require_superadmin), db: AsyncSession = De
 
 @app.get("/admin/orgs/{org_id}")
 async def admin_org_detail(
-    org_id: int, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    org_id: int, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     org = await db.get(Org, org_id)
     if org is None:
@@ -144,7 +146,7 @@ async def admin_org_detail(
 
 
 @app.get("/admin/users")
-async def admin_users(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)) -> list[dict]:
+async def admin_users(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)) -> list[dict]:
     users = (await db.execute(select(User))).scalars().all()
     mems_by_user: dict[int, list] = {}  # all memberships in one query, grouped (was one query per user)
     for m in (await db.execute(select(Membership))).scalars().all():
@@ -164,7 +166,7 @@ async def admin_users(_: str = Depends(require_superadmin), db: AsyncSession = D
 
 
 @app.get("/admin/tools")
-async def admin_tools(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)) -> list[dict]:
+async def admin_tools(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)) -> list[dict]:
     tools = (await db.execute(select(Tool))).scalars().all()
     omap = {o.id: o for o in (await db.execute(  # batched (was one db.get per tool)
         select(Org).where(Org.id.in_({t.org_id for t in tools}))
@@ -175,7 +177,7 @@ async def admin_tools(_: str = Depends(require_superadmin), db: AsyncSession = D
 
 @app.get("/admin/calls")
 async def admin_calls(
-    limit: int = 50, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    limit: int = 50, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> list[dict]:
     limit = max(1, min(limit, 1000))
     rows = (await db.execute(select(CallRecord).order_by(CallRecord.id.desc()).limit(limit))).scalars().all()
@@ -191,7 +193,7 @@ _ERROR_EVIDENCE_EXPIRED = "<expired>"
 async def admin_errors(
     days: int = 7, limit: int = 100, provider: str | None = None, status: int | None = None,
     tier: str | None = None,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """Failed calls with the evidence to explain them — the caller's request and the provider's own
     answer (see models.CallRecord.error_request).
@@ -201,7 +203,7 @@ async def admin_errors(
 
     Ageing happens HERE rather than on the request path. There is no scheduler in this app by design
     (see the comment above `_claim_idempotent`), and the obvious lazy hook — a marker written on the
-    request session — cannot work: `get_session` never commits, so the marker would roll back and the
+    request session — cannot work: `get_admin_session` never commits, so the marker would roll back and the
     purge would then run on every single failed call. Doing it on this route costs one UPDATE to the
     person who came to read errors, which is exactly who wants the stale ones gone.
     """
@@ -243,17 +245,26 @@ async def admin_errors(
     }
 
 
+_purge_lock = asyncio.Lock()
+
+
 async def _purge_expired_error_evidence() -> int:
     """Blank the evidence columns past the retention window; returns how many rows were cleared.
 
     An UPDATE, not a DELETE: `callrecord` is the audit trail and the rest of the row must survive.
     The sentinel rather than NULL keeps "captured, then aged out" distinguishable from "never
     captured" — without it an old failure and a successful call look identical. Runs on its own
-    session because the request's session is not committed for us.
+    session because the request's session is not committed for us, and on the BACKGROUND pool
+    rather than admin's: it is a retention sweep nobody is reading, and nesting a second admin
+    session inside an admin request would hold two of that pool's few slots at once.
+
+    Single-flighted: the sweep is idempotent and driven by whoever happens to open the errors page,
+    so N concurrent readers would otherwise run N identical bulk UPDATEs and hold N background
+    slots. One at a time makes it one entry in `db.BACKGROUND_CONSUMERS` instead of `admin`'s size.
     """
     cutoff = _utcnow_naive() - timedelta(days=_ERROR_EVIDENCE_TTL_DAYS)
     try:
-        async with session_maker() as db:
+        async with _purge_lock, background_session_maker() as db:
             result = await db.execute(
                 update(CallRecord)
                 # `coalesce`, not a bare `!=`: SQL three-valued logic makes `error_response !=
@@ -275,7 +286,7 @@ async def _purge_expired_error_evidence() -> int:
 
 
 @app.get("/admin/health")
-async def admin_health(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)) -> list[dict]:
+async def admin_health(_: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)) -> list[dict]:
     rows = (await db.execute(select(Secret).where(Secret.health_status != "ok"))).scalars().all()
     omap = {o.id: o for o in (await db.execute(  # batched (was one db.get per secret)
         select(Org).where(Org.id.in_({s.org_id for s in rows}))
@@ -286,6 +297,14 @@ async def admin_health(_: str = Depends(require_superadmin), db: AsyncSession = 
         out.append({"secret_id": s.id, "name": s.name, "org": org.slug if org else None,
                     "kind": s.kind, "status": s.health_status, "detail": s.health_detail})
     return out
+
+
+@app.get("/admin/kv", include_in_schema=False)
+async def admin_kv(_: str = Depends(require_superadmin)) -> dict:
+    """Is the shared key-value store reachable? `configured` false means the in-process fallback
+    (no `TREG_KV_URL`); `reachable` false with it configured means every budgeted invitation is
+    currently withheld (infra/kv.py fails closed)."""
+    return {"configured": kv.configured(), "reachable": await kv.store().ping()}
 
 
 # Rebind app so the second block keeps its decorator text and remains a separate attach point.
@@ -299,7 +318,7 @@ reports_router = app
 @app.get("/admin/reconcile/drift")
 async def admin_reconcile_drift(
     since_days: int = 30, min_calls: int = 3,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """Endpoints whose observed cost has wandered from the catalog's estimate. Only the providers that
     report their own charge in-band appear (see `reconcile.price_drift`)."""
@@ -312,7 +331,7 @@ async def admin_reconcile_drift(
 
 @app.get("/admin/reconcile/spend")
 async def admin_reconcile_spend(
-    since_days: int = 30, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    since_days: int = 30, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """Settled platform spend per provider — the number to hold next to the provider's own invoice."""
     since = reconcile.window_start(since_days)
@@ -323,12 +342,24 @@ async def admin_reconcile_spend(
 @app.get("/admin/reconcile/repeats")
 async def admin_reconcile_repeats(
     since_days: int = 30, top: int = 10,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """How much of the bill was the same query twice — the cache-worthiness measurement."""
     since = reconcile.window_start(since_days)
     return {"since": since.isoformat(), "since_days": since_days,
             **await reconcile.repeat_rate(db, since, top=top)}
+
+
+@app.get("/admin/reconcile/asynctasks")
+async def admin_reconcile_asynctasks(
+    since_days: int = 30,
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    """Deferred holds, absorbed timeouts, usage overruns (team paid more than reserved), block
+    shortfalls (platform absorbed), and provider task outcomes."""
+    since = reconcile.window_start(since_days)
+    return {"since": since.isoformat(), "since_days": since_days,
+            **await reconcile.async_task_settlement(db, since)}
 
 
 _ARCHIVE_REPORT_TTL_S = 30
@@ -338,7 +369,7 @@ _archive_report_cache: dict = {}
 @app.get("/admin/archive")
 async def admin_archive(
     top: int = 50,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """Phase 0's read-out, served from the recorder-maintained running totals
     (ArchiveEndpointStat): ~50 tiny rows instead of walking every key and snapshot — the old
@@ -350,7 +381,8 @@ async def admin_archive(
     import time as _time
     hit = _archive_report_cache.get(top)
     if hit and _time.monotonic() - hit[0] < _ARCHIVE_REPORT_TTL_S:
-        return hit[1]
+        return hit[1] | {"change_outcomes": dict(archive_mod.change_outcomes),
+                         "body_outcomes": dict(archive_mod.archive_bodies.outcomes)}
 
     stats = (await db.execute(
         select(ArchiveEndpointStat)
@@ -389,6 +421,15 @@ async def admin_archive(
             "kept_bytes": st.kept_bytes,
         })
     report = {"mode": archive_mod.mode(),
+              "change_outcomes": dict(archive_mod.change_outcomes),
+              "body_outcomes": dict(archive_mod.archive_bodies.outcomes),
+              "comparison_mode": "json",
+              "ttl_policy": "adaptive",
+              "serve_endpoints": sorted(archive_mod.serve_endpoints()),
+              "serve_percent": get_settings().archive_serve_percent,
+              "serve_max_age_s": get_settings().archive_serve_max_age_s,
+              # Cumulative counters include observations from older comparison policies.
+              "change_statistics_scope": "lifetime_mixed_comparison_modes",
             "worker_on": archive_mod.worker_enabled(),
             "refresh_daily_cap": get_settings().archive_refresh_daily_cap,
             "keys": int(totals[0]), "snapshots": int(totals[1]),
@@ -402,7 +443,7 @@ async def admin_archive(
 @app.get("/admin/archive/keys")
 async def admin_archive_keys(
     endpoint_id: str, limit: int = 20,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """The panel's inspector feed: this endpoint's keys (most recently demanded first), each with
     its timer state and its last versions, plus the endpoint's recent call events (served hits and
@@ -439,7 +480,6 @@ async def admin_archive_keys(
             "fetched_at": k.fetched_at.isoformat(),
             "last_requested_at": k.last_requested_at.isoformat() if k.last_requested_at else None,
             "last_changed_at": k.last_changed_at.isoformat() if k.last_changed_at else None,
-            "volatile_paths": k.volatile_paths or [],
             "question": f"{k.req_method} {k.req_url}"[:200] if k.req_url else "",
             "versions": [{
                 "version": version, "origin": origin, "size_bytes": size_bytes,
@@ -461,7 +501,7 @@ async def admin_archive_keys(
 @app.get("/admin/archive/body")
 async def admin_archive_body(
     key_hash: str, version: int,
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """One stored answer's BYTES, for the panel's version viewer. Follows a dedup reference to
     the row that carries the body; a hash-only version answers honestly that nothing was kept.
@@ -492,10 +532,13 @@ async def admin_archive_body(
     return {"key_hash": key_hash, "version": snap.version, "origin": snap.origin,
             "fetched_at": snap.fetched_at.isoformat(), "media_type": snap.media_type,
             "size_bytes": snap.size_bytes, "stored": body is not None,
+            "body_storage": snap.body_storage,
             "carried_by_version": carrier,
             "body_text": text,
             "note": None if body is not None else
-            "hash-only: the licence (or the size cap) did not allow keeping the bytes"}
+            "body stored in object storage; this DB viewer does not fetch it"
+            if snap.body_storage in ("r2", "both") else
+            "hash-only: body bytes are unavailable (policy, size, pruning or storage failure)"}
 
 
 @app.get("/admin/archive/panel", response_class=HTMLResponse, include_in_schema=False)
@@ -513,7 +556,7 @@ async def admin_archive_panel() -> FileResponse:
 @app.get("/admin/referrals")
 async def admin_referrals(
     status: str = "", limit: int = Query(200, ge=1, le=1000),
-    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session),
+    _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     """Every referral, across every team — who invited whom, what it cost, and what is still owed.
 
@@ -581,7 +624,7 @@ mutations_router = app
 
 @app.post("/admin/users/{user_id}/superadmin")
 async def admin_set_superadmin(
-    user_id: int, body: BoolIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    user_id: int, body: BoolIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     user = await db.get(User, user_id)
     if user is None:
@@ -596,7 +639,7 @@ async def admin_set_superadmin(
 
 @app.post("/admin/users/{user_id}/suspend")
 async def admin_suspend_user(
-    user_id: int, body: BoolIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    user_id: int, body: BoolIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     user = await db.get(User, user_id)
     if user is None:
@@ -610,7 +653,7 @@ async def admin_suspend_user(
 
 @app.delete("/admin/users/{user_id}")
 async def admin_delete_user(
-    user_id: int, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    user_id: int, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     user = await db.get(User, user_id)
     if user is None:
@@ -620,7 +663,7 @@ async def admin_delete_user(
     mem = (await db.execute(select(Membership).where(Membership.user_id == user_id))).scalars().all()
     affected = {m.org_id for m in mem}
     for m in mem:
-        await delete_membership(db, m)
+        await delete_membership(db, m, actor_email=principal)
     await db.flush()
     emptied = []
     for oid in affected:
@@ -646,7 +689,7 @@ async def admin_delete_user(
 
 @app.post("/admin/orgs/{org_id}/suspend")
 async def admin_suspend_org(
-    org_id: int, body: BoolIn, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    org_id: int, body: BoolIn, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     org = await db.get(Org, org_id)
     if org is None:
@@ -658,7 +701,7 @@ async def admin_suspend_org(
 
 @app.delete("/admin/orgs/{org_id}")
 async def admin_delete_org(
-    org_id: int, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    org_id: int, _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     org = await db.get(Org, org_id)
     if org is None:
@@ -697,7 +740,7 @@ class CreditIn(BaseModel):
 
 @app.post("/admin/orgs/{org_id}/credit")
 async def admin_credit_org(
-    org_id: int, body: CreditIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_session)
+    org_id: int, body: CreditIn, principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session)
 ) -> dict:
     """Credit an org with promotional balance — the HTTP equivalent of scripts/manual_grant.py.
 

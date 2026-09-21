@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.background import BackgroundTask
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import analytics
 from .. import audit
 from .. import sandbox as demo_sandbox
 from ..application.call.access import catalog_endpoint_access as get_catalog_endpoint_access
@@ -19,7 +23,13 @@ from ..application.call.resolve import (
     QueryValues,
     _may_have_body as may_have_body,
 )
-from ..application.call.service import create_call_context, execute_call, _refusal_kind
+from ..application.call.service import (
+    _refusal_kind,
+    _tool_called_props,
+    create_call_context,
+    execute_call,
+)
+from ..application.call.invite import invitation
 from ..application.call.intake import (
     META_HEADER,
     CallMeta,
@@ -27,14 +37,16 @@ from ..application.call.intake import (
 )
 from ..application.call.types import CallerSnapshot, CallFailure, CallInput, UpstreamResponse
 from ..caller_metadata import _client_of
+from ..call_surface import split_call_path
 from ..config import get_settings
+from ..domain.catalog import store as catalog_store
 from ..domain.governance import access as access_policy
 from ..domain.governance import publicdemo as publicdemo_policy
+from ..domain.governance import usage as usage_policy
 from ..domain.identity.access import Caller, require_member
 from ..infra.db import get_session
 from ..models import Tool
 from .auth import _client_ip
-from .orgs import count_today
 
 
 # The app alias preserves the moved handlers' decorator text byte-for-byte.
@@ -75,6 +87,25 @@ def _http_upstream_response(upstream: UpstreamResponse) -> StreamingResponse:
     return response
 
 
+def _attach_async_descriptor(upstream: UpstreamResponse, context, rest: str = "") -> None:
+    """Attach static catalog metadata before Starlette starts the upstream body stream.
+
+    An idempotent replay returns before marketplace resolution, so the endpoint is taken from the
+    path itself: a `--await` retry of a stored submission must still learn how to poll the task
+    that is already running, or it would print the body and stop."""
+    marketplace = context.marketplace
+    endpoint_id = marketplace.endpoint_id if marketplace is not None else rest.split("?", 1)[0]
+    endpoint = catalog_store.load().by_id.get(endpoint_id)
+    descriptor = endpoint.get("async") if endpoint else None
+    if not descriptor:
+        return
+    value = json.dumps(descriptor, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    upstream.raw_headers = tuple(
+        (name, existing) for name, existing in upstream.raw_headers
+        if name.lower() != b"x-treg-async"
+    ) + ((b"x-treg-async", value),)
+
+
 def _require_tool_use_http(caller: Caller, tool: Tool) -> None:
     try:
         access_policy._require_tool_use(caller, tool)
@@ -92,17 +123,16 @@ async def _enforce_public_demo_ip_cap(request: Request, db: AsyncSession) -> Non
 
 
 async def _enforce_daily_cap(caller: Caller, db: AsyncSession) -> None:
-    """Refuse a call/run once the caller has used their per-user daily cap for this org. `-1` (the
-    default) = unlimited, so unmetered members pay ZERO extra queries. The sandbox has its own limiter
-    and is exempt. Soft by design: the count reads best-effort `CallRecord`s, so under heavy load it
-    can lag slightly and fail OPEN (a few extra slip through) — never closed. See docs/USAGE-METERING-PLAN.md."""
-    cap = caller.membership.daily_call_cap
-    if cap < 0 or demo_sandbox.is_sandbox(caller.org):
-        return
-    used = await count_today(db, caller.org_id, caller.email)
-    if used >= cap:
-        raise HTTPException(status_code=429, detail=(
-            f"daily usage limit reached ({used}/{cap}) — ask an admin to raise your cap"))
+    """The run surfaces' door to the per-user daily cap - the SAME gate `/call/` goes through
+    (`application/call/authorize.py`), so a member cannot dodge the cap by switching path. Commits,
+    because the gate takes the slot with a write and this request's session is the only owner."""
+    try:
+        await usage_policy.enforce_daily_cap(
+            caller, db, sandbox=demo_sandbox.is_sandbox(caller.org))
+    except usage_policy.UsagePolicyError as exc:
+        await db.commit()
+        raise HTTPException(status_code=429, detail=exc.detail) from exc
+    await db.commit()
 
 
 def _translate_call_failure(exc: CallFailure) -> HTTPException:
@@ -130,8 +160,65 @@ def _may_have_body(request: Request) -> bool:
     return may_have_body(tuple(request.headers.raw))
 
 
-async def _stamp_call_exit(request: Request, resp: Response, status_code: int) -> None:
-    """Give one `/call/` exit the three things every other exit gets: the id that joins the response
+def _call_rest(request: Request, context: object | None) -> str:
+    rest = getattr(getattr(context, "input", None), "raw_rest", None)
+    if rest is not None:
+        return rest
+    call_path = split_call_path(request.url.path)
+    return call_path[1] if call_path else request.url.path.lstrip("/")
+
+
+def _capture_exceptional_call(
+    request: Request, *, call_ref: str, status_code: int, failure_kind: str,
+) -> None:
+    """Mirror a call that never reached the normal audit funnel without leaking request data."""
+    context = getattr(request.state, "call_context", None)
+    marketplace = getattr(context, "marketplace", None)
+    target = getattr(context, "target", None)
+    rest = _call_rest(request, context)
+    tool_name = (
+        getattr(marketplace, "endpoint_id", None)
+        or getattr(getattr(target, "tool", None), "name", None)
+        or rest.split("/", 1)[0]
+        or "-"
+    )
+    props = _tool_called_props(
+        request,
+        tool_name=tool_name,
+        status_code=status_code,
+        call_ref=call_ref,
+        own_tool=(False if marketplace is not None else True if target is not None else None),
+        refused_by=None,
+        answered=False,
+    ) | {"failure_kind": failure_kind, "provider": None, "endpoint_id": None}
+    if marketplace is not None:
+        props |= {
+            "provider": marketplace.provider,
+            "endpoint_id": marketplace.endpoint_id,
+            "tier": marketplace.tier,
+            "metered": marketplace.metered,
+            "cost_type": marketplace.cost_type,
+        }
+    elif target is not None:
+        props["provider"] = urlsplit(target.upstream).hostname or ""
+    org_id, email = getattr(request.state, "call_identity", (None, ""))
+    team_slug = getattr(request.state, "call_team_slug", "")
+    analytics.capture(
+        email or "anonymous",
+        "tool_called",
+        props,
+        groups={"team": team_slug} if org_id is not None and team_slug else None,
+    )
+
+
+async def _stamp_call_exit(
+    request: Request,
+    resp: Response,
+    status_code: int,
+    *,
+    failure_kind: str | None = None,
+) -> None:
+    """Give one call-surface exit the three things every other exit gets: the id that joins the response
     to the audit row, the row itself, and the release of any idempotency label the request took.
 
     Shared by the two handlers that answer a call without reaching `call_tool`'s own bookkeeping.
@@ -144,12 +231,19 @@ async def _stamp_call_exit(request: Request, resp: Response, status_code: int) -
         resp.headers["X-Treg-Cost-Micro"] = str(cost_micro)
     if not getattr(request.state, "call_audited", False):
         org_id, email = getattr(request.state, "call_identity", (None, ""))
-        rest = request.url.path[len("/call/"):]
+        key_id, key_name, key_prefix = getattr(request.state, "call_key", (None, None, None))
+        context = getattr(request.state, "call_context", None)
+        rest = _call_rest(request, context)
         audit.record_call(
             org_id=org_id, user_email=email, tool_name=rest.split("/", 1)[0] or "—",
             method=request.method, path=request.url.path, status_code=status_code,
             client=_client_of(request), refused_by=_refusal_kind(status_code),
+            api_key_id=key_id, api_key_name=key_name, api_key_prefix=key_prefix,
             telemetry={"call_ref": call_ref})
+        if failure_kind:
+            _capture_exceptional_call(
+                request, call_ref=call_ref, status_code=status_code, failure_kind=failure_kind)
+        request.state.call_audited = True
     # A failed call must not keep its idempotency label. The claim is taken before the upstream
     # call, and a request that dies anywhere after that — a bad parameter, a deny rule, an empty
     # balance, a saturated pool — would otherwise hold the label for the whole window and answer
@@ -174,6 +268,17 @@ async def catalog_endpoint_access(
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
 
+def _capture_hint(request: Request, context, kind: str) -> None:
+    """One event per invitation actually sent, on every surface: the response-rate denominator.
+    Attachment is not display; the surface's `X-Treg-Client` says who was asked."""
+    marketplace = context.marketplace
+    slug = context.input.caller.org.slug
+    analytics.capture(analytics.SERVER_DISTINCT_ID, "hint_attached", {
+        "kind": kind, "call_id": context.call_ref, "client": _client_of(request),
+        "endpoint_id": marketplace.endpoint_id if marketplace is not None else None,
+    }, groups={"team": slug} if slug else None)
+
+
 @app.api_route(
     "/call/{rest:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
@@ -187,6 +292,12 @@ async def call_tool(
     # tool, deny rule, daily cap) leaves this handler without an audit row, and the exception handler
     # is the one place every such refusal passes through — but it has no Caller of its own.
     request.state.call_identity = (caller.org_id, caller.email)
+    request.state.call_team_slug = caller.org.slug
+    request.state.call_key = (
+        caller.api_key.id if caller.api_key else None,
+        caller.api_key.name if caller.api_key else None,
+        caller.api_key.safe_prefix if caller.api_key else None,
+    )
     # Faithful-relay: use the RAW request path, not Starlette's decoded path param. Decoding is
     # lossy — an encoded slash (`%2f`) in `rest` would become a real `/` and change the upstream
     # route (npm's scoped publish `PUT /@scope%2fname` 404s as `/@scope/name`). httpx preserves
@@ -213,10 +324,39 @@ async def call_tool(
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
     request.state.call_ref = context.call_ref
+    request.state.call_context = context
     try:
-        return _http_upstream_response(await execute_call(context, request.app.state.http))
+        upstream = await execute_call(context, request.app.state.http)
+        _attach_async_descriptor(upstream, context, rest)
+        response = _http_upstream_response(upstream)
+        try:
+            # Optional invitation, decided before the body streams (application/call/invite.py).
+            kind = await invitation(context, response.status_code,
+                                    replayed=bool(response.headers.get("X-Treg-Idempotent-Replay")))
+            if kind is not None:
+                response.headers["X-Treg-Hint"] = kind
+                if kind == "review":
+                    response.headers["X-Treg-Review"] = "requested"  # read by CLI <= 0.18
+                _capture_hint(request, context, kind)
+        except Exception:
+            pass  # A fault here can only lose the header; the answer is already built.
+        return response
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
+    except PoolTimeoutError:
+        # The application-wide handler owns the typed 503 and its db_pool event.
+        raise
+    except Exception:
+        # Starlette still owns the bare 500 response. Record the attempted call before re-raising so
+        # this treg-owned failure is represented once in the same funnel as normal call outcomes.
+        request.state.idem_claim = context.idempotency
+        request.state.call_audited = context.audited
+        request.state.call_cost_micro = context.cost_micro
+        await _stamp_call_exit(
+            request, Response(status_code=500), 500, failure_kind="unexpected_exception")
+        context.idempotency = request.state.idem_claim
+        context.audited = request.state.call_audited
+        raise
     finally:
         request.state.idem_claim = context.idempotency
         request.state.call_audited = context.audited

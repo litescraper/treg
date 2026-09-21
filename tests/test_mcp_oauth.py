@@ -11,6 +11,8 @@ other MCP server must not spend a treg balance just because it happens to be val
 
 from __future__ import annotations
 
+from conftest import verified_signup
+
 import json
 import time
 
@@ -112,7 +114,7 @@ async def test_a_session_cookie_is_not_an_access_token():
     """treg mints session cookies and identity tokens with the same HMAC construction. Without a type
     marker one class of credential would silently validate as another — a browser session becoming an
     MCP grant, which nobody consented to."""
-    cookie = session.make(7)
+    cookie = session.make_session(7)
     assert mcp._oauth_claims(cookie) is None
     assert mcp_oauth.read_access_token(cookie, expected_audience=mcp_oauth.mcp_resource_url()) is None
 
@@ -326,7 +328,7 @@ async def _register(clients, redirect="https://client.test/cb"):
 async def _signed_in(clients, email="oauth-user@superdesign.dev"):
     """A browser session plus the org it belongs to. The consent step is a HUMAN action, so it needs
     a session cookie rather than a token."""
-    r = await clients.post("/users", json={"email": email})
+    r = await verified_signup(clients, json={"email": email})
     assert r.status_code == 200, r.text
     token = r.json()["token"]
     prev = clients.headers.get("X-Treg-Token")
@@ -343,7 +345,7 @@ async def _signed_in(clients, email="oauth-user@superdesign.dev"):
 
     async with session_maker() as db:
         user = (await db.execute(select(User).where(User.email == me["email"]))).scalar_one()
-        cookie = _sess.make(user.id, token_version=user.token_version)
+        cookie = _sess.make_session(user.id, token_version=user.token_version)
     clients.cookies.set("treg_session", cookie)   # on the client: httpx deprecates per-request
     return cookie, org_id
 
@@ -376,6 +378,8 @@ async def test_the_whole_flow_end_to_end(clients):
         "redirect_uri": "https://client.test/cb", "client_id": client_id,
         "code_verifier": verifier, "resource": mcp_oauth.mcp_resource_url()})
     assert tok.status_code == 200, tok.text
+    assert tok.headers["cache-control"] == "no-store"
+    assert tok.headers["pragma"] == "no-cache"
     access = tok.json()["access_token"]
     assert tok.json()["token_type"] == "Bearer"
 
@@ -1053,7 +1057,7 @@ async def _as(email: str) -> dict:
 
     async with session_maker() as db:
         user = (await db.execute(select(User).where(User.email == email))).scalar_one()
-    return {"X-Treg-Token": _sess.make(user.id, token_version=user.token_version)}
+    return {"X-Treg-Token": _sess.make_identity(user.id, token_version=user.token_version)}
 
 
 async def test_the_team_on_a_grant_can_be_moved_without_reconnecting(clients):

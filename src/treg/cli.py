@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import webbrowser
@@ -41,6 +42,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 import httpx
 
 from . import agents as _agents
+from .feedback_contract import FEEDBACK_CATEGORIES, FEEDBACK_DESCRIPTION, REVIEW_USEFULNESS, REVIEW_DESCRIPTION
 # One source of truth for the proxy's default port (help text below). Importing the module is cheap —
 # it pulls only stdlib plus httpx, which the CLI already has; `cryptography` stays lazy inside it.
 from .localproxy import DEFAULT_PORT as _PROXY_DEFAULT_PORT
@@ -77,12 +79,14 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Write-then-rename so an interrupted save (kill / full disk) can't leave a truncated,
     # unparseable config that bricks every subsequent command.
     tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2))
+    tmp.chmod(0o600)
     os.replace(tmp, CONFIG_PATH)
+    CONFIG_PATH.chmod(0o600)
 
 
 def _token_org_claim(token: str | None) -> str | None:
@@ -97,7 +101,17 @@ def _token_org_claim(token: str | None) -> str | None:
         return None
 
 
-def _pick_active_org(cfg: dict) -> None:
+def _token_scope_claim(token: str | None) -> str | None:
+    """Read the signed token's local scope hint; the server remains the authority."""
+    try:
+        payload = token.split(".", 1)[0]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return claims.get("scp") or None
+    except Exception:
+        return None
+
+
+def _pick_active_org(cfg: dict, *, pin: bool = True) -> None:
     """Best-effort: set the active org from GET /orgs. The token is already persisted by the
     caller, so a transient failure here (proxy hiccup, cold restart) must never lose it."""
     try:
@@ -118,35 +132,53 @@ def _pick_active_org(cfg: dict) -> None:
         pass
     # Bake the chosen team into the token so it also works OUTSIDE the CLI (curl, MCP, an agent env),
     # where no X-Treg-Org header travels.
-    _pin_token_to_active_org(cfg)
+    if pin:
+        _pin_token_to_active_org(cfg)
 
 
-def _pin_token_to_active_org(cfg: dict) -> None:
-    """Re-mint the stored identity token with the ACTIVE ORG baked into its claim.
+def _default_token_for_org(cfg: dict, org: str, *, session_cookies=None) -> tuple[str | None, str]:
+    """Get one active team Default key without changing the local configuration."""
+    try:
+        with _client(cfg, auth=session_cookies is None) as c:
+            r = c.get("/auth/cli-token", headers={"X-Treg-Org": org}, cookies=session_cookies)
+    except Exception:  # noqa: BLE001 — the caller decides whether this optional exchange is required
+        return None, "could not reach the registry"
+    try:
+        data = r.json()
+    except Exception:  # noqa: BLE001 — an edge/proxy response need not be JSON
+        data = {}
+    if r.status_code != 200:
+        return None, data.get("detail") or f"the registry returned {r.status_code}"
+    if data.get("org") != org or not data.get("token"):
+        return None, "the registry did not return this team's Default key"
+    state = data.get("default_key_state")
+    if state not in (None, "active"):  # None keeps compatibility with servers before managed keys
+        return None, f"this team's Default key is {state}"
+    return data["token"], ""
+
+
+def _pin_token_to_active_org(cfg: dict, *, session_cookies=None) -> None:
+    """Replace the stored identity credential with the active team's Default key.
 
     A plain identity token names a person, not a team, so treg cannot know which team to bill and
     answers `choose an org (send X-Treg-Org)`. The CLI hides that by sending the header itself — but
     the token is the thing people copy OUT of the CLI: into curl, into an MCP client's Authorization,
     into an agent's env. There it fails, confusingly, and the fix is invisible.
 
-    `GET /auth/cli-token` with `X-Treg-Org` returns the same identity token with the org pinned, which
-    is exactly how the dashboard's "your API key" works as a bare bearer. Switching teams still works:
-    an explicit `X-Treg-Org` header always beats the claim, and `treg org use` re-pins.
+    `GET /auth/cli-token` with `X-Treg-Org` returns the deterministic Default key that the dashboard
+    shows for that membership. A direct email login uses its fresh browser session cookie for this
+    exchange; an ordinary `org use` authenticates with the current stored credential.
 
-    Best-effort by design — the caller has already persisted a working token, and an older server
+    Best-effort by design — the caller has already persisted a credential, and an older server
     without this route must not turn a successful login into a failure.
     """
     org = cfg.get("active_org")
     if not org or not cfg.get("identity"):
         return
-    try:
-        with _client(cfg) as c:
-            r = c.get("/auth/cli-token", headers={"X-Treg-Org": org})
-        if r.status_code == 200 and r.json().get("org") == org:
-            cfg["token"] = r.json()["token"]
-            _save_config(cfg)
-    except Exception:  # noqa: BLE001 — a pin is an upgrade, never a reason to lose the session
-        pass
+    token, _ = _default_token_for_org(cfg, org, session_cookies=session_cookies)
+    if token:
+        cfg["token"] = token
+        _save_config(cfg)
 
 
 def _effective_org(cfg: dict) -> str | None:
@@ -207,7 +239,8 @@ def _detect_runtime() -> str:
 
 
 def _client(cfg: dict, *, auth: bool = True) -> httpx.Client:
-    headers = {"ngrok-skip-browser-warning": "1", "X-Treg-Client": _detect_runtime()}
+    headers = {"ngrok-skip-browser-warning": "1", "X-Treg-Client": _detect_runtime(),
+               "X-Treg-Key-Protocol": "1"}
     # TREG_TOKEN (+ optional TREG_ORG) beats the config file: per-PROCESS identity, so each coding
     # agent on one machine can act as its own scoped agent while ~/.treg/config.json stays the
     # human's. Per-process env is the standard way a runtime carries its own identity — and
@@ -285,7 +318,11 @@ def _show(resp: httpx.Response) -> None:
         print(json.dumps(body, indent=2))
     except Exception:
         print(resp.text)
+    if resp.status_code < 400:
+        _show_charge_line(resp)
+        _show_hint_line(resp)
     if resp.status_code >= 400:
+        _show_failure_diagnostics(resp)
         # 402 = the team balance can't cover a call on treg's key. The JSON above already carries the
         # numbers an agent needs; a human gets the two commands that fix it.
         if resp.status_code == 402 and isinstance(body, dict) and isinstance(body.get("detail"), dict):
@@ -300,6 +337,63 @@ def _show(resp: httpx.Response) -> None:
                 print("(no valid active team — pick one with `treg org use <slug>`; see `treg org ls`)",
                       file=sys.stderr)
         sys.exit(1)
+
+
+def _show_charge_line(resp: httpx.Response) -> None:
+    """The bill for a metered call, on stderr, next to the answer: `X-Treg-Cost-Micro` is the settled
+    charge and `X-Treg-Call-Id` the record to quote — neither is in the provider's body, which is all
+    stdout carries. A customer who saw only `results` and `next_token` could not tell whether a
+    $0.13 estimate or a $0.0067 row had been charged and stopped testing (2026-09-04). Silent for an
+    unmetered call (no header) — a team's own key is never billed — and for every non-call response."""
+    headers = getattr(resp, "headers", {}) or {}
+    cost = headers.get("X-Treg-Cost-Micro")
+    if cost is None:
+        return
+    line = f"treg: charged ${int(cost) / 1_000_000:g}"
+    if headers.get("X-Treg-Idempotent-Replay"):
+        line += " by the original call (this is a replay — nothing new charged)"
+    if call_id := headers.get("X-Treg-Call-Id"):
+        line += f" · call id {call_id}"
+    print(line, file=sys.stderr)
+
+
+def _show_hint_line(resp: httpx.Response) -> None:
+    """The server's optional invitation (`X-Treg-Hint: review|feedback`), one stderr line beside the
+    charge line. `X-Treg-Review: requested` is the older review-only header a pre-0.19 registry
+    still sends. stdout stays the exact body."""
+    headers = getattr(resp, "headers", {}) or {}
+    call_id = headers.get("X-Treg-Call-Id")
+    kind = headers.get("X-Treg-Hint")
+    if kind is None and headers.get("X-Treg-Review") == "requested":
+        kind = "review"
+    if not call_id:
+        return
+    if kind == "review":
+        print(f'treg: after using this result, run treg review {call_id} '
+              '<useful|partly|not_useful|not_sure> [--reason "..."]; '
+              'omit private data, then keep going with the task.', file=sys.stderr)
+    elif kind == "feedback":
+        print('treg: anything confusing or wrong about this call, even if it worked? '
+              'treg feedback submit <quality|pricing|friction|other> "what you saw" '
+              f'--call-id {call_id}; omit private data, then keep going with the task.',
+              file=sys.stderr)
+
+
+def _show_failure_diagnostics(resp: httpx.Response) -> None:
+    """One stderr line an agent can file a failure under: the HTTP status, WHOSE answer it is, and the
+    call id support can look up. The body above is printed verbatim, so for a relayed upstream error it
+    is the vendor's own JSON with no status and no id — a runner saving only stdout recorded 115 Moz
+    quota 403s as a generic "cli_error" and never learned they were free (2026-09-04). `X-Treg-Error`
+    marks treg's own refusals; its absence on a 4xx/5xx means the provider answered and treg relayed
+    it unchanged. stderr only — stdout stays the exact body for whatever parses it."""
+    headers = getattr(resp, "headers", {}) or {}
+    whose = "treg refused the call" if headers.get("X-Treg-Error") else "the provider answered; treg relayed it unchanged"
+    line = f"treg: HTTP {resp.status_code} — {whose}"
+    if call_id := headers.get("X-Treg-Call-Id"):
+        line += f"; call id {call_id} (quote it to support; `treg calls` shows the record)"
+    if cost := headers.get("X-Treg-Cost-Micro"):
+        line += f"; charged ${int(cost) / 1_000_000:g}"
+    print(line, file=sys.stderr)
 
 
 def _as_list(resp: httpx.Response) -> list[dict]:
@@ -329,7 +423,13 @@ def cmd_config(args, cfg) -> None:
 
 def cmd_login(args, cfg) -> None:
     if args.token:  # agent / CI: a token directly (a per-org token, or a dashboard identity token)
-        cfg.update(token=args.token, active_org=None, identity=False)  # drop any stale active_org
+        # A typed human Default/bootstrap is still an identity credential and may participate in
+        # the CLI's deliberate team-selection flow. Opaque Additional/Agent keys stay fixed to the
+        # membership they authenticate and must not be exchanged as a human.
+        cfg.update(
+            token=args.token, active_org=None,
+            identity=_token_scope_claim(args.token) in ("team", "bootstrap"),
+        )  # drop any stale active_org
         # VERIFY before claiming success — a rejected token used to print "Token saved" and only fail on
         # the first real call ("misleading"). /auth/me needs no org, so it validates either token kind.
         try:
@@ -353,7 +453,7 @@ def cmd_login(args, cfg) -> None:
         return
     if getattr(args, "email", None):  # email one-time-code (register-or-login by proving an email)
         base = cfg["base_url"].rstrip("/")
-        h = {"ngrok-skip-browser-warning": "1"}
+        h = {"ngrok-skip-browser-warning": "1", "X-Treg-Key-Protocol": "1"}
         r = httpx.post(f"{base}/auth/email/start", json={"email": args.email}, headers=h, timeout=15)
         if r.status_code >= 400:
             _show(r)
@@ -369,7 +469,8 @@ def cmd_login(args, cfg) -> None:
         d = r.json()
         cfg.update(token=d["token"], email=d["email"], identity=True)
         _save_config(cfg)  # persist the freshly-minted token BEFORE the optional org lookup
-        _pick_active_org(cfg)
+        _pick_active_org(cfg, pin=False)
+        _pin_token_to_active_org(cfg, session_cookies=r.cookies)
         print(f"✓ Logged in as {cfg['email']}. Active org: {cfg.get('active_org')}")
         _maybe_offer_onboarding(cfg)
         return
@@ -1351,7 +1452,8 @@ def cmd_accept(args, cfg) -> None:
             sys.exit(f"no pending invite for '{args.org}' — run `treg invites`")
         r = c.post(f"/invites/{inv['id']}/accept")
         if r.status_code == 200:
-            cfg["active_org"] = inv["org"]
+            data = r.json()
+            cfg.update(token=data["token"], active_org=data["org"], identity=True)
             _save_config(cfg)
         _show(r)
 
@@ -2253,6 +2355,149 @@ def cmd_tool_update(args, cfg) -> None:
 
 
 # ---- call + audit -------------------------------------------------------------------------
+# The descriptor semantics (dotted paths, terminal classification, artifact extraction) are the
+# server's own `treg.domain.asynctasks`, a stdlib-only leaf - one implementation, pinned light by
+# `test_import_lightness` and an import-linter contract, so the CLI and the settlement worker can
+# never disagree about what "done" means.
+from .domain.asynctasks import ExtractionError as _AsyncExtractionError  # noqa: E402
+from .domain.asynctasks import artifact as _async_artifact  # noqa: E402
+from .domain.asynctasks import extract_submission as _extract_submission  # noqa: E402
+from .domain.asynctasks import fetch_command as _async_fetch_command  # noqa: E402
+from .domain.asynctasks import shown as _shown  # noqa: E402
+from .domain.asynctasks import classify_terminal as _classify_terminal  # noqa: E402
+from .domain.asynctasks import json_path as _json_path  # noqa: E402
+
+
+def _async_param(rule: dict) -> tuple[str, str]:
+    return str(rule["in"]), str(rule["name"])
+
+
+def _clock_report(clock, message: str) -> None:
+    reporter = getattr(clock, "report", None)
+    if reporter is not None:
+        reporter(message)
+
+
+class _CliAwaitClock:
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def report(self, message: str) -> None:
+        print(message, file=sys.stderr)
+
+
+def await_async_task(descriptor: dict, submission: httpx.Response, call_fn, clock,
+                     timeout: float) -> dict:
+    """Follow one async descriptor using injected HTTP and clock functions."""
+    try:
+        submitted = submission.json()
+    except ValueError:
+        return {"code": 1, "error": "the async submission response is not JSON"}
+    try:
+        # The server's own reading of the submission: task id, and for dynamic polling an https
+        # URL on the descriptor's allow-list - the same rule the settlement worker applies.
+        extracted = _extract_submission(descriptor, submitted)
+    except _AsyncExtractionError as exc:
+        # The provider's answer IS the diagnosis (MiniMax puts "invalid params, ..." in a 200);
+        # hand it to stdout as any other response, then say what treg could not find in it.
+        return {"code": 1, "response": submission, "error": str(exc)}
+    task_id = extracted.task_id
+    poll = descriptor["poll"]
+    if poll.get("endpoint"):
+        _, param_name = _async_param(poll["param"])
+        target = poll["endpoint"]
+        params = [(param_name, task_id)]
+        recovery = f"treg call {target} -p {shlex.quote(param_name + '=' + task_id)}"
+    else:
+        target = extracted.poll_url
+        params = []
+        recovery = f"treg call {shlex.quote(target)}"
+
+    interval = float(descriptor.get("interval") or 10)
+    start = clock.monotonic()
+    failures = 0
+    warned: set[str] = set()
+    while True:
+        if clock.monotonic() - start >= timeout:
+            return {"code": 3, "task_id": str(task_id), "recovery": recovery,
+                    "error": "timed out while waiting for the async task"}
+        clock.sleep(interval if failures == 0 else min(60.0, interval * (2 ** (failures - 1))))
+        try:
+            response = call_fn(target, params)
+        except (httpx.RequestError, OSError) as exc:
+            failures += 1
+            _clock_report(clock, f"async poll retry {failures}/5 after a network error: {exc}")
+            if failures >= 5:
+                return {"code": 3, "task_id": str(task_id), "recovery": recovery,
+                        "error": f"polling failed five consecutive times: {exc}"}
+            continue
+        if response.status_code >= 500:
+            failures += 1
+            _clock_report(clock, f"async poll retry {failures}/5 after HTTP {response.status_code}")
+            if failures >= 5:
+                return {"code": 3, "task_id": str(task_id), "recovery": recovery,
+                        "error": f"polling returned {response.status_code} five consecutive times"}
+            continue
+        if response.status_code >= 400:
+            return {"code": 3, "task_id": str(task_id), "recovery": recovery,
+                    "error": f"polling returned HTTP {response.status_code}"}
+        failures = 0
+        try:
+            terminal = response.json()
+        except ValueError:
+            return {"code": 3, "task_id": str(task_id), "recovery": recovery,
+                    "error": "a polling response was not JSON"}
+        status = str(_json_path(terminal, descriptor["status"]["path"]))
+        outcome = _classify_terminal(descriptor, terminal)
+        if outcome == "success":
+            result = {"code": 0, "task_id": str(task_id), "recovery": recovery,
+                      "response": response, "status": status}
+            found = _async_artifact(descriptor, terminal)
+            if descriptor["result"].get("path"):
+                result["result"] = found["result"]
+            elif found["fetch"] is None:
+                value_from = descriptor["result"]["fetch_param"]["value_from"]
+                return {"code": 1, "task_id": str(task_id), "recovery": recovery,
+                        "response": response, "status": status,
+                        "error": f"the terminal response has no {value_from!r} for result retrieval"}
+            else:
+                result["fetch_command"] = _async_fetch_command(found["fetch"])
+            if found["ttl_note"]:
+                result["ttl_note"] = found["ttl_note"]
+            return result
+        if outcome == "failure":
+            return {"code": 2, "task_id": str(task_id), "recovery": recovery,
+                    "response": response, "status": status}
+        if status not in warned:
+            warned.add(status)
+            _clock_report(clock, f"warning: unknown async status {_shown(status)!r}; continuing to wait")
+        _clock_report(clock, f"async task {_shown(task_id)}: {_shown(status)} "
+                             f"({int(clock.monotonic() - start)}s elapsed)")
+
+
+def _print_raw_response(response: httpx.Response) -> None:
+    sys.stdout.write(response.text)
+    sys.stdout.flush()
+
+
+def _show_call_response(response: httpx.Response) -> None:
+    content_type = getattr(response, "headers", {}).get("content-type", "").partition(";")[0].strip().lower()
+    if content_type and content_type != "application/json" and not content_type.endswith("+json") \
+            and not content_type.startswith("text/"):
+        sys.stdout.buffer.write(response.content)
+        sys.stdout.buffer.flush()
+        if response.status_code >= 400:
+            _show_failure_diagnostics(response)
+            raise SystemExit(1)
+        _show_charge_line(response)
+        _show_hint_line(response)
+        return
+    _show(response)
+
+
 def cmd_call(args, cfg) -> None:
     for kv in args.query:  # a token without '=' would crash dict()/split with an opaque traceback
         if "=" not in kv:
@@ -2326,7 +2571,72 @@ def cmd_call(args, cfg) -> None:
     # `treg call <id> --data …` just work beats asking the caller to repeat what the catalog knows.
     method = args.method or ("POST" if content is not None else "GET")
     with _client(cfg) as c:
-        _show(c.request(method, f"/call/{rest}", params=params, content=content, headers=headers))
+        submission = c.request(method, f"/call/{rest}", params=params, content=content, headers=headers)
+        if not getattr(args, "await_task", False) or not submission.headers.get("X-Treg-Async"):
+            _show_call_response(submission)
+            return
+        if submission.status_code >= 400:
+            _show(submission)
+            return
+        try:
+            descriptor = json.loads(submission.headers["X-Treg-Async"])
+        except (TypeError, ValueError):
+            sys.exit("treg: X-Treg-Async is not valid JSON")
+
+        def call_fn(target, poll_params):
+            # Dynamic poll URLs still travel THROUGH treg. Calling the absolute upstream URL from
+            # the CLI would bypass server-side credential injection and the host safety check.
+            return c.get(f"/call/{target}", params=poll_params)
+
+        try:
+            submitted = submission.json()
+        except ValueError:
+            submitted = None
+        task_id, recovery = None, ""
+        try:
+            extracted = _extract_submission(descriptor, submitted) if submitted is not None else None
+        except _AsyncExtractionError:
+            extracted = None
+        if extracted is not None:
+            task_id = extracted.task_id
+            poll = descriptor.get("poll") or {}
+            if poll.get("endpoint"):
+                _, resume_name = _async_param(poll["param"])
+                recovery = f"treg call {poll['endpoint']} -p {shlex.quote(resume_name + '=' + task_id)}"
+            elif extracted.poll_url:
+                recovery = f"treg call {shlex.quote(extracted.poll_url)}"
+        if task_id not in (None, ""):
+            print(f"async task submitted: {_shown(task_id)}", file=sys.stderr)
+            if recovery:
+                print(f"resume: {recovery}", file=sys.stderr)
+        if reserved := submission.headers.get("X-Treg-Cost-Micro"):
+            print(f"generation reservation: ${int(reserved) / 1_000_000:g}", file=sys.stderr)
+        try:
+            outcome = await_async_task(
+                descriptor, submission, call_fn, _CliAwaitClock(), getattr(args, "timeout", None)
+            )
+        except KeyboardInterrupt:
+            print("treg: waiting interrupted; the upstream task is still recoverable", file=sys.stderr)
+            if recovery:
+                print(f"resume: {recovery}", file=sys.stderr)
+            raise SystemExit(3) from None
+        response = outcome.get("response")
+        if response is not None:
+            _print_raw_response(response)
+        if outcome.get("result") not in (None, ""):
+            value = outcome["result"]
+            rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            print(f"result: {rendered}", file=sys.stderr)
+        if outcome.get("fetch_command"):
+            # What comes back is the provider's own retrieval answer: the file bytes (OpenRouter) or
+            # a JSON envelope carrying a download URL (MiniMax) - the command is the same shape.
+            print(f"retrieve the result (file bytes, or JSON with a download URL): "
+                  f"{outcome['fetch_command']}", file=sys.stderr)
+        if outcome.get("ttl_note"):
+            print(f"download promptly; result lifetime: {outcome['ttl_note']}", file=sys.stderr)
+        if outcome.get("error"):
+            print(f"treg: {outcome['error']}", file=sys.stderr)
+        raise SystemExit(outcome["code"])
 
 
 def cmd_calls(args, cfg) -> None:
@@ -2365,7 +2675,12 @@ def cmd_audit(args, cfg) -> None:
     rows = [
         {"kind": "call", "id": f"c{x['id']}", "user_email": x.get("user_email"),
          "tool": x.get("tool_name"), "detail": f"{x.get('method', '')} {x.get('path', '')}".strip(),
-         "result": x.get("status_code"), "where": "proxy", "created_at": x.get("created_at")}
+         "result": x.get("status_code"), "where": "proxy", "created_at": x.get("created_at"),
+         # A metered async task (generation): how it settled and where its artifact is. `treg calls`
+         # carries the full block verbatim; this is the merged view's one-line reading of it.
+         **({"task": {k: x["async_task"].get(k) for k in
+                      ("status", "settled_micro", "result_url", "fetch_command", "ttl_note")}}
+            if x.get("async_task") else {})}
         for x in calls
     ] + [
         {"kind": "run", "id": r.get("id"), "user_email": r.get("user_email"), "tool": r.get("tool"),
@@ -3483,6 +3798,9 @@ def cmd_mcp_install(args, cfg) -> None:
     token = os.environ.get("TREG_TOKEN") or cfg.get("token")
     if not token:
         sys.exit("no token — run `treg login` first (or `treg login --token <key>`), then retry")
+    if _token_scope_claim(token) == "bootstrap":
+        sys.exit("This temporary login token cannot be installed into MCP — nothing was written. "
+                 "Choose or create a team first, then retry with its Default or Agent key.")
     # VERIFY before fanning the token out into every agent config on this machine — the same check
     # `treg login --token` runs. Without it, a garbage token (a stale TREG_TOKEN, a mangled paste)
     # is written silently into Claude/Cursor/opencode, and the failure surfaces days later inside
@@ -3836,9 +4154,7 @@ def cmd_org_create(args, cfg) -> None:
         r = c.post("/orgs", json={"name": args.name})
     if r.status_code == 200:
         d = r.json()
-        cfg["active_org"] = d["org"]
-        if not cfg.get("identity"):  # per-org-token mode needs the new org's token to act in it
-            cfg["token"] = d["token"]
+        cfg.update(token=d["token"], active_org=d["org"], identity=True)
         _save_config(cfg)
     _show(r)
 
@@ -3857,8 +4173,8 @@ def cmd_org_ls(args, cfg) -> None:
 
 def cmd_org_use(args, cfg) -> None:
     # Validate BEFORE persisting: a typo'd slug used to save silently and then fail every later
-    # command with the server's bare "choose an org (send X-Treg-Org)". Offline/older servers
-    # degrade to the old behavior (set + warn) rather than blocking the switch.
+    # command with the server's bare "choose an org (send X-Treg-Org)". The Default-key exchange
+    # below is also required before the local team and token can change.
     try:
         with _client(cfg) as c:
             r = c.get("/orgs")
@@ -3872,9 +4188,20 @@ def cmd_org_use(args, cfg) -> None:
                      f"see `treg org ls`; active org unchanged.")
     else:
         print("warning: could not verify the team against the registry", file=sys.stderr)
-    cfg["active_org"] = args.slug
+    if cfg.get("identity"):
+        # Get the new credential before changing either local value. A team-scoped Default key and
+        # a different active_org are an unusable pair, so this exchange is required during a switch.
+        token, detail = _default_token_for_org(cfg, args.slug)
+        if not token:
+            sys.exit(f"could not switch to {args.slug!r}: {detail}. Active team unchanged.")
+        cfg.update(token=token, active_org=args.slug)
+    else:
+        # Opaque Additional and Agent keys are fixed to their configured membership. They may
+        # confirm that team, but they must not be presented as human team-switching credentials.
+        if cfg.get("active_org") != args.slug:
+            sys.exit("this key cannot switch teams; run `treg login` as a human first. "
+                     "Active team unchanged.")
     _save_config(cfg)
-    _pin_token_to_active_org(cfg)  # re-pin, so the copyable token follows the switch
     print(f"active org: {args.slug}")
 
 
@@ -4290,7 +4617,7 @@ def cmd_org_join(args, cfg) -> None:
         r = c.post("/invites/accept", json={"code": args.code, "email": args.email})
     if r.status_code == 200:
         d = r.json()
-        cfg.update(token=d["token"], active_org=d["org"], email=args.email, identity=False)
+        cfg.update(token=d["token"], active_org=d["org"], email=args.email, identity=True)
         _save_config(cfg)
     _show(r)
 
@@ -4325,6 +4652,28 @@ def cmd_org_delete(args, cfg) -> None:
         r = c.delete(f"/orgs/{org_id}", params={"confirm": args.slug})
     if r.status_code == 200:
         _clear_active_if_targeted(cfg)
+    _show(r)
+
+
+def cmd_org_rename(args, cfg) -> None:
+    if not args.name and not args.slug:
+        sys.exit("nothing to change: pass --name and/or --slug")
+    body = {k: v for k, v in (("name", args.name), ("slug", args.slug)) if v}
+    with _client(cfg) as c:
+        org_id = _active_org_id(cfg, c)
+        if org_id is None:
+            sys.exit("no active org")
+        r = c.patch(f"/orgs/{org_id}", json=body)
+    if r.status_code == 200 and not _JSON_OVERRIDE:
+        o = r.json()
+        # The server keeps the old slug as an alias, so the pinned token stays valid; only the
+        # local active_org needs to follow the rename.
+        if o.get("previous_slug") and cfg.get("active_org") == o["previous_slug"]:
+            cfg["active_org"] = o["org"]
+            _save_config(cfg)
+        print(f"team: {o['name']}  slug: {o['org']}"
+              + (f"  (was {o['previous_slug']}; existing keys keep working)" if o.get("previous_slug") else ""))
+        return
     _show(r)
 
 
@@ -4397,8 +4746,14 @@ def _cost_label(cost) -> str:
     """A price you can scan in a column: "$0.001/success", "free", "quota rows"."""
     if not isinstance(cost, dict):
         return "-"
+    if cost.get("display_unit") and cost.get("display_usd") is not None:
+        return (f"${cost['display_usd']:.3g}" + cost.get("display_suffix", "")
+                + "/" + cost["display_unit"])
     kind = (cost.get("type") or "").replace("_", " ")
     value, currency = cost.get("value"), cost.get("currency") or ""
+    if value in (None, "") and isinstance(cost.get("table"), list):
+        # A price table: the ceiling is the scalar (matches `usd`); `_cost_usd` shows the range.
+        value = (cost.get("fallback") or {}).get("value")
     if kind == "free":
         return "free"
     if value in (None, ""):
@@ -4615,6 +4970,9 @@ def _cost_usd(cost: dict | None) -> str:
     column, so USD stands alone here; `treg catalog get` carries the native amount alongside it."""
     if not isinstance(cost, dict):
         return "-"
+    if cost.get("display_unit") and cost.get("display_usd") is not None:
+        return (f"${cost['display_usd']:.3g}" + cost.get("display_suffix", "")
+                + "/" + cost["display_unit"])
     usd = cost.get("usd")
     if usd is None:
         # no rate for this unit (a provider that publishes no per-credit price): the native
@@ -4624,7 +4982,18 @@ def _cost_usd(cost: dict | None) -> str:
             "per call": "call", "per result": "result", "per success": "success"}.get(cost.get("type"), "call")
     # 3 significant digits: no decision turns on the 5th decimal of a sub-cent price, and the full
     # value (plus the provider's own currency) is one `treg catalog get` away
-    return "free" if not usd else f"${usd:.3g}/{unit}"
+    if not usd:
+        return "free"
+    rate = cost.get("rate_usd")  # a duration-priced table: quoted per second, as the model is sold
+    if isinstance(rate, (int, float)) and cost.get("rate_unit"):
+        low = cost.get("rate_usd_min")
+        if isinstance(low, (int, float)) and low < rate:
+            return f"${low:.3g}-${rate:.3g}/{cost['rate_unit']}"
+        return f"${rate:.3g}/{cost['rate_unit']}"
+    low = cost.get("usd_min")  # a price table: the cheapest row up to the validated ceiling
+    if isinstance(low, (int, float)) and low < usd:
+        return f"${low:.3g}-${usd:.3g}/{unit}"
+    return f"${usd:.3g}/{unit}"
 
 
 def _clip(text: str, width: int) -> str:
@@ -4687,6 +5056,121 @@ def _catalog_search(query: str, args, cfg) -> None:
               f"{'●' if e['provider'] in connected else ' '}  {_clip(e.get('summary', ''), 78)}")
     _close_group()
     _dim(f"\ntreg catalog get {rows[0]['id']}   # params, cost, example response")
+
+
+def _feedback_error(code: str, message: str, **details) -> None:
+    print(json.dumps({"error": code, "message": message, **details}))
+    raise SystemExit(1)
+
+
+def _feedback_request(cfg, method: str, path: str, **kwargs) -> None:
+    submitting = method == "POST"
+    uncertain = "Could not confirm whether feedback was saved. Check connectivity before submitting again."
+    try:
+        with _client(cfg) as client:
+            response = client.request(method, path, **kwargs)
+    except httpx.RequestError:
+        _feedback_error("submission_unconfirmed" if submitting else "request_failed",
+                        uncertain if submitting else "Could not retrieve feedback. Check connectivity and retry.")
+    # Validation responses can echo rejected input. Never print arbitrary response bodies on errors.
+    if response.status_code >= 400:
+        errors = {
+            401: ("authentication_required", "Sign in with `treg login`, or check the configured token."),
+            403: ("access_denied", "Check the active team and your token's permissions."),
+            404: ("not_found", "No feedback is available with this ID in the active team. Check the ID and team."),
+            422: ("invalid_feedback", "Check the fields with `treg feedback submit --help`. "
+                  "Messages must contain 1-2000 characters; at most 100 call IDs are allowed."),
+            429: ("rate_limited", "This team has reached its feedback submission limit. Try again later."),
+        }
+        code, message = errors.get(response.status_code, (
+            "submission_unconfirmed" if submitting else "request_failed",
+            uncertain if submitting else "Could not retrieve feedback. Try again later.",
+        ))
+        _feedback_error(code, message, http_status=response.status_code)
+    try:
+        body = response.json()
+    except ValueError:
+        _feedback_error("invalid_response", uncertain if submitting else "Invalid response. Retry the lookup later.")
+    print(json.dumps(body, indent=2))
+
+
+def cmd_review(args, cfg) -> None:
+    call_id = args.call_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", call_id):
+        _feedback_error("invalid_call_id", "Use the call ID from the catalog call response.")
+    reason = args.reason.strip() if args.reason is not None else None
+    if reason is not None and not 1 <= len(reason) <= 200:
+        _feedback_error("invalid_reason", "Reason must contain 1-200 characters after trimming. Omit private data.")
+    body = {"call_id": call_id, "usefulness": args.usefulness}
+    if reason is not None:
+        body["reason"] = reason
+    uncertain = "Could not confirm whether the review was saved. Retry with the same call ID to confirm."
+    try:
+        with _client(cfg) as client:
+            response = client.post("/reviews", json=body)
+    except httpx.RequestError:
+        _feedback_error("submission_unconfirmed", uncertain)
+    if response.status_code >= 400:
+        errors = {
+            400: ("not_catalog_call", "Reviews require a catalog call, not a team's own tool."),
+            401: ("authentication_required", "Sign in with `treg login`, or check the configured token."),
+            403: ("access_denied", "Check the active team and your token's permissions."),
+            404: ("not_found", "Call record not found in the active team; it may not be written yet. Retry shortly."),
+            422: ("invalid_review", "Check the fields with `treg review --help`. Omit private data."),
+        }
+        code, message = errors.get(response.status_code, ("submission_unconfirmed", uncertain))
+        _feedback_error(code, message, http_status=response.status_code)
+    try:
+        receipt = response.json()
+    except ValueError:
+        _feedback_error("invalid_response", uncertain)
+    print(json.dumps(receipt, indent=2))
+
+
+def cmd_host(args, cfg) -> None:
+    """`treg host <file>`: host a reference image / audio / video so a vendor can fetch it by URL.
+    AIGC endpoints take references as public URLs; paste hosts fail vendor probes at random, and an
+    agent on a laptop has nothing better. Prints the URL alone so it drops straight into --data."""
+    import mimetypes
+    p = Path(args.file).expanduser()
+    if not p.is_file():
+        sys.exit(f"treg host: file not found: {p}")
+    ctype = args.content_type or mimetypes.guess_type(p.name)[0] or ""
+    if not ctype:
+        sys.exit(f"treg host: cannot guess the media type of {p.name}; pass --content-type image/png (or audio/*, video/*)")
+    with _client(cfg) as c:
+        r = c.post("/media", content=p.read_bytes(), headers={"content-type": ctype})
+    if r.status_code >= 400:
+        _show(r)
+        sys.exit(1)
+    body = r.json()
+    if _JSON_OVERRIDE:  # the global --json: main() pops it from argv before argparse sees it
+        print(json.dumps(body, indent=2))
+    else:
+        print(body["url"])
+        print(f"  {body['content_type']}, {body['size']} bytes, expires {body['expires_at']}", file=sys.stderr)
+
+
+def cmd_feedback(args, cfg) -> None:
+    if args.message == "-" and sys.stdin.isatty():
+        _feedback_error("stdin_required", "Pipe sanitized text or redirect a file into stdin when using '-'.")
+    message = sys.stdin.read() if args.message == "-" else args.message
+    length = len(message.strip())
+    if not 1 <= length <= 2000:
+        _feedback_error("invalid_message", "Message must contain 1-2000 characters after trimming. "
+                        "Edit the description and submit again.", actual_length=length, max_length=2000)
+    body = {"category": args.category, "message": message}
+    if args.call_id:
+        body["call_ids"] = args.call_id
+    if args.endpoint_id:
+        body["endpoint_id"] = args.endpoint_id
+    _feedback_request(cfg, "POST", "/feedback", json=body)
+
+
+def cmd_feedback_get(args, cfg) -> None:
+    if args.feedback_id < 1:
+        _feedback_error("invalid_id", "Feedback ID must be a positive integer from a submission receipt.")
+    _feedback_request(cfg, "GET", f"/feedback/{args.feedback_id}")
 
 
 def _catalog_request(text: str, cfg) -> None:
@@ -4782,7 +5266,8 @@ def _catalog_get(endpoint_id: str, cfg) -> None:
             flag = f"  {_AM}exhausted{_R}" if c.get("exhausted") else ""
             print(f"  {i:<3}{_clip(c['endpoint_id'], 38):<38} {price:<9} {accepts}{flag}")
         _dim("  a miss tries the next one (ceiling $1 per call by default); --header 'X-Treg-Route-Max-Cost: 0.05' to cap it,")
-        _dim("  --header 'X-Treg-Route-Waterfall: 0' to stop at the first miss")
+        _dim("  --header 'X-Treg-Route-Waterfall: 0' to stop at the first miss,")
+        _dim("  --header 'X-Treg-Route-Strict-Filters: 1' to refuse (422, unbilled) rather than call a provider that ignores a filter you sent")
         also = routing.get("also") or []
         if also:
             print(f"\n{_A}ALSO{_R}  {_M}the same job from providers treg does not route to (yet) — call them by id{_R}")
@@ -4822,9 +5307,14 @@ def _catalog_get(endpoint_id: str, cfg) -> None:
         _dim("  the only provider offering this capability")
 
     _print_params(e.get("input") or {})
+    _print_price_table(e.get("cost"), e.get("input") or {})
+    _print_async(e.get("async"))
 
     print(f"\n{_B}RUN IT{_R}")
-    print(f"  {body['call_template']}")
+    template = body['call_template']
+    if e.get("async") and "--await" not in template:
+        template += " --await --timeout 900"
+    print(f"  {template}")
     _dim("  the key is injected server-side — you never hold it")
     # Which credential tier would serve THIS caller (registered tool / org credential / treg's own
     # metered key / none)? Authenticated + best-effort: signed-out readers and older servers skip it.
@@ -4871,12 +5361,35 @@ def _print_params(inp: dict) -> None:
             continue
         # required first: the shortest working call is the required set, and that is what an agent
         # reads this table to assemble
-        for name, spec in sorted(params.items(), key=lambda kv: (not (kv[1] or {}).get("required")
-                                                                 if isinstance(kv[1], dict) else True, kv[0])):
-            spec = spec if isinstance(spec, dict) else {}
-            note = spec.get("note") or ""
+        # A nested object (Replicate's `input: {properties: …}`) is shown as dotted names, one row per
+        # leaf, because that is what the caller has to type.
+        flat: list[tuple[str, dict]] = []
+
+        def walk(items: dict, prefix: str) -> None:
+            for name, spec in items.items():
+                spec = spec if isinstance(spec, dict) else {}
+                props = spec.get("properties")
+                if isinstance(props, dict) and props:
+                    walk(props, f"{prefix}{name}.")
+                else:
+                    flat.append((f"{prefix}{name}", spec))
+
+        walk(params, "")
+        for name, spec in sorted(flat, key=lambda kv: (not kv[1].get("required"), kv[0])):
+            # The NOTE column is the whole contract: the prose rule, then the closed set of values,
+            # the default, the numeric range, the example. An agent choosing "the cheapest valid
+            # request" needs the enum and the bounds more than the prose.
+            parts = [spec.get("note") or ""]
+            if isinstance(spec.get("enum"), list) and spec["enum"]:
+                parts.append("one of: " + " | ".join(str(v) for v in spec["enum"]))
+            if "default" in spec:
+                parts.append(f"default {spec['default']}")
+            lo, hi = spec.get("min"), spec.get("max")
+            if lo is not None or hi is not None:
+                parts.append(f"range {lo if lo is not None else '…'}-{hi if hi is not None else '…'}")
             if spec.get("example") not in (None, ""):
-                note = f"{note} (e.g. {spec['example']})".strip()
+                parts.append(f"e.g. {spec['example']}")
+            note = " · ".join(p.rstrip(".") if i else p for i, p in enumerate(parts) if p)
             # The note is the contract ("one of domain | company", "THIS IS THE PRICE DIAL") — never
             # clipped: an agent reading this table to build a call must see the whole rule. Long
             # notes wrap under the NOTE column instead.
@@ -4890,6 +5403,69 @@ def _print_params(inp: dict) -> None:
         import textwrap
         for i, line in enumerate(textwrap.wrap(inp["note"], width=90)):
             print(f"  {_M}{'note' if i == 0 else '':<6}{_R} {line}")
+
+
+def _print_price_table(cost, inp: dict) -> None:
+    """The price rows a `cost.table` endpoint bills by - the matrix behind the "$low-$high" line.
+    Rows are the provider's own price list, first match wins; the fallback is what an unmatched
+    request reserves."""
+    if not isinstance(cost, dict) or not isinstance(cost.get("table"), list) or not cost["table"]:
+        return
+    cur = cost.get("currency") or "USD"
+    money = (lambda v: f"${v:g}") if cur == "USD" else (lambda v: f"{v:g} {cur}")
+    settle = cost.get("settle", "table")
+    print(f"\n{_B}PRICE TABLE{_R}  first matching row; unmatched requests reserve the fallback")
+    for row in cost["table"]:
+        if not isinstance(row, dict):
+            continue
+        when = " · ".join(f"{k.split('.', 1)[-1]}={v}" for k, v in (row.get("when") or {}).items())
+        price = money(float(row.get("value") or 0))
+        if row.get("times"):
+            price += f" × {str(row['times']).split('.', 1)[-1]}"
+            if row.get("times_min") is not None:
+                price += f" (from {row['times_min']})"
+        print(f"  {_clip(when, 58):<58} {price}")
+    fb = cost.get("fallback") or {}
+    if isinstance(fb, dict) and fb.get("value") is not None:
+        print(f"  {'fallback (ceiling)':<58} {money(float(fb['value']))}")
+    if settle == "usage":
+        usage = cost.get("usage") or {}
+        _dim(f"  settle: usage - the matched row is reserved; the provider's reported "
+             f"{usage.get('path', 'usage')} is what you pay")
+        _dim("  (it can exceed the reserve when the provider applies a minimum charge).")
+    else:
+        _dim("  settle: table - the matched row is reserved at submission and charged when the task succeeds.")
+
+
+def _print_async(desc) -> None:
+    """How an async generation call is followed - the same descriptor `--await` executes and the
+    `X-Treg-Async` header carries, so an MCP or raw-HTTP agent can poll it by hand."""
+    if not isinstance(desc, dict) or not desc:
+        return
+    print(f"\n{_B}ASYNC TASK{_R}  the call returns at once; the result arrives later")
+    print(f"  task id      response field `{desc.get('id_from')}`")
+    poll = desc.get("poll") or {}
+    if poll.get("endpoint"):
+        param = poll.get("param") or {}
+        print(f"  poll         treg call {poll['endpoint']} -p {param.get('name')}=<task id>"
+              f"   every ~{desc.get('interval', 10)} s")
+    elif poll.get("url_from"):
+        print(f"  poll         the URL in response field `{poll['url_from']}` (hosts: "
+              f"{', '.join(poll.get('url_hosts') or [])})   every ~{desc.get('interval', 10)} s")
+    status = desc.get("status") or {}
+    print(f"  done when    `{status.get('path')}` is one of {status.get('success')}; "
+          f"failed when {status.get('failure')} (a failed task refunds the hold)")
+    result = desc.get("result") or {}
+    if result.get("path"):
+        print(f"  result       response field `{result['path']}`")
+    elif result.get("fetch"):
+        fp = result.get("fetch_param") or {}
+        print(f"  result       treg call {result['fetch']} -p {fp.get('name')}=<`{fp.get('value_from')}` "
+              f"from the finished task>")
+    if result.get("ttl_note"):
+        print(f"  lifetime     {result['ttl_note']} - download promptly; treg never stores media")
+    _dim("  `treg call … --await` does all of this and prints the final response; from a coding")
+    _dim("  agent, raise the shell tool's timeout or run it in the background (video takes 1-5 min).")
 
 
 def cmd_connections_ls(args, cfg) -> None:
@@ -4978,8 +5554,11 @@ HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ("THE CATALOG — tools you don't have a key for", [
         ("catalog", "Find a tool by what you want to DO. ~2,600 endpoints, each with its price."),
         ("call", "Call a tool: a catalog endpoint by id, or one of your own by URL."),
+        ("host", "Host a reference image / audio / video at a public URL for a vendor to fetch."),
         ("balance", "Prepaid balance: credit left, calls in flight, recent spend."),
         ("topup", "Add funds, or set up automatic top-ups."),
+        ("feedback", "Share a problem or suggestion about treg."),
+        ("review", "Rate a catalog call after using its result."),
     ]),
     ("YOUR OWN TOOLS — what your team already has", [
         ("tool", "Manage tools (endpoint or CLI)."),
@@ -5280,6 +5859,10 @@ def build_parser() -> argparse.ArgumentParser:
     mk(og, "leave", "Remove yourself from the active team.", "treg org leave").set_defaults(fn=cmd_org_leave)
     od = mk(og, "delete", "Delete a team you own (confirms by name).", "treg org delete superdesign")
     od.add_argument("slug", help="the org slug to delete"); od.set_defaults(fn=cmd_org_delete)
+    orn = mk(og, "rename", "Rename the active team and/or change its slug (admin+). Existing keys keep working.",
+             'treg org rename --name "Superdesign"', "treg org rename --slug superdesign")
+    orn.add_argument("--name", help="new display name"); orn.add_argument("--slug", help="new slug (lowercase letters, digits, hyphens)")
+    orn.set_defaults(fn=cmd_org_rename)
 
     # ---- secrets ----
     s = mk(sub, "secret", "Manage stored credentials (encrypted server-side, never returned).",
@@ -5347,12 +5930,13 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- calling ----
     cl = mk(sub, "call", "Call a tool through the proxy: `call <tool> <path>` or `call <full-url>`. Key injected server-side.",
             "treg call stripe v1/charges", "treg call https://api.stripe.com/v1/charges",
-            "treg call posthog api/events --query limit=5", "treg call slack chat.postMessage --method POST --data '{\"channel\":\"C1\"}'")
+            "treg call posthog api/events --query limit=5", "treg call slack chat.postMessage --method POST --data '{\"channel\":\"C1\"}'",
+            "treg call reapi.tasks.get --query id=task_01a09ddf   # a catalog id: path/query params go in --query, never in a path")
     cl.add_argument("target", help="a tool name, or a full upstream URL")
     cl.add_argument("path", nargs="?", default="", help="the path when using a tool name")
     cl.add_argument("--method", default=None,
                     help="HTTP method (default: GET, or POST when --data/--file/--upload is given)")
-    cl.add_argument("--query", action="append", default=[], metavar="K=V", help="a query param (repeatable)")
+    cl.add_argument("-p", "--query", action="append", default=[], metavar="K=V", help="a query param (repeatable)")
     cl.add_argument("--authorization-method", metavar="METHOD",
                     help="select an authorization method declared by the catalog endpoint")
     cl.add_argument("--data", help="request body (string)"); cl.add_argument("--file", help="request body from a file")
@@ -5365,6 +5949,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a multipart/form-data part (repeatable): NAME=@/path/to/file for a file, or "
                          "NAME=value for a plain field. Use for real file uploads (e.g. Meta adimages) — "
                          "--file sends a single raw body that most upload APIs reject.")
+    cl.add_argument("--await", dest="await_task", action="store_true",
+                    help="wait for an async catalog call to reach a terminal state")
+    cl.add_argument("--timeout", type=float, default=900,
+                    help="maximum seconds to wait with --await (default: 900)")
     cl.set_defaults(fn=cmd_call)
 
     # ---- audit (one log over both halves; `calls`/`runs` live on as hidden aliases) ----
@@ -5601,6 +6189,66 @@ def build_parser() -> argparse.ArgumentParser:
     im = sub.add_parser("import", description="(deprecated) old name for `treg upload`.", formatter_class=_RAWFMT)
     _upload_args(im)
 
+    review = mk(sub, "review", REVIEW_DESCRIPTION,
+                'treg review CALL_ID useful --reason "Helped answer the question."')
+    review.add_argument("call_id", help="the call ID from a catalog call response")
+    review.add_argument("usefulness", choices=REVIEW_USEFULNESS, help="how the result helped your task")
+    review.add_argument("--reason", help="optional sanitized reason, 1-200 characters")
+    review.set_defaults(fn=cmd_review)
+
+    ho = mk(sub, "host", "Host a reference file (image / audio / video) at a public URL that a vendor can fetch: "
+            "the image_urls / audio_urls an AIGC endpoint takes. 30 MB per file, 7-day TTL, free.",
+            "treg host face.jpg", "treg host voice.mp3 --content-type audio/mpeg",
+            "treg host face.jpg --json   # the full response: url, token, content_type, size, expires_at",
+            "treg call reapi.video-gen.seedance-2-5 --data \"{\\\"image_urls\\\":[\\\"$(treg host face.jpg)\\\"], …}\"")
+    ho.add_argument("file", help="the local file to host")
+    ho.add_argument("--content-type", dest="content_type", metavar="TYPE", help="override the type guessed from the extension")
+    ho.set_defaults(fn=cmd_host)
+
+    fb = mk(sub, "feedback", "Submit or retrieve private team feedback.",
+            'treg feedback submit friction "The pagination example is unclear."',
+            'treg feedback submit quality "The result is outdated." --call-id CALL_ID --endpoint-id PROVIDER.ENDPOINT',
+            'treg feedback submit other - < sanitized-feedback.txt',
+            'treg feedback get 123')
+    fb.description = textwrap.fill(FEEDBACK_DESCRIPTION, width=88)
+    feedback_fields = (
+        "\n\nSubmission fields:\n"
+        "  category       Required: quality (results), pricing (charges/prices),\n"
+        "                 friction (using treg), other (requests/suggestions).\n"
+        "  message        Required: what you needed and what happened, 1-2000 characters.\n"
+        "                 State uncertainty; use - to read sanitized text from stdin.\n"
+        "  --call-id ID   Optional: the treg call ID returned with the relevant call.\n"
+        "                 Repeat for multiple calls (up to 100); sent as call_ids.\n"
+        "                 IDs written only in message are not linked automatically.\n"
+        "  --endpoint-id ID\n"
+        "                 Optional: public catalog endpoint ID; sent as endpoint_id.\n"
+        "\nReceipt: JSON with feedback_id and status=received. Retrieve with:\n"
+        "  treg feedback get FEEDBACK_ID\n"
+        "Reports go to your configured registry and active team, cost nothing, and\n"
+        "are visible to that team and registry administrators. No automatic reply.\n"
+    )
+    fb.epilog += feedback_fields + "\nFull syntax: treg feedback submit --help"
+    fb.set_defaults(fn=lambda args, cfg: fb.print_help())
+    feedback_commands = fb.add_subparsers(dest="sub", metavar="<subcommand>")
+    submit = mk(feedback_commands, "submit", "Submit a problem or suggestion.",
+                'treg feedback submit friction "The pagination example is unclear."',
+                'treg feedback submit quality "The returned data is outdated." --call-id CALL_ID',
+                'treg feedback submit other - < sanitized-feedback.txt')
+    submit.description = textwrap.fill(FEEDBACK_DESCRIPTION, width=88)
+    submit.add_argument("category", choices=FEEDBACK_CATEGORIES,
+                        help="quality: results; pricing: charges/prices; friction: using treg; other: requests/suggestions")
+    submit.add_argument("message",
+                        help="what you needed and observed, 1-2000 characters; state uncertainty; - reads stdin")
+    submit.add_argument("--call-id", action="append",
+                        help="returned treg call ID; repeat up to 100; sent as call_ids, not extracted from message")
+    submit.add_argument("--endpoint-id", help="public catalog endpoint ID, if known")
+    submit.epilog += feedback_fields + "\nMore: <your registry base URL>/feedback.md"
+    submit.set_defaults(fn=cmd_feedback)
+    get = mk(feedback_commands, "get", "Retrieve a feedback report from the active team.",
+             "treg feedback get 123")
+    get.add_argument("feedback_id", type=int, help="the feedback ID from the submission receipt")
+    get.set_defaults(fn=cmd_feedback_get)
+
     # ---- balance ----
     bal = mk(sub, "balance", "Your team's prepaid balance: credit left, calls in flight, recent spend.",
              "treg balance", "treg balance --limit 50", "treg balance --json    # micro-USD integers")
@@ -5765,6 +6413,9 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     override = _pop_org_flag(argv)
     _JSON_OVERRIDE = _pop_json_flag(argv)
+    # Preserve the original submission shorthand; help teaches the explicit subcommands.
+    if len(argv) > 1 and argv[0] == "feedback" and argv[1] in FEEDBACK_CATEGORIES:
+        argv.insert(1, "submit")
     parser = build_parser()
     if _looks_like_a_program(argv, _subcommands(parser)):
         argv = ["with", *argv]
@@ -5772,7 +6423,25 @@ def main(argv: list[str] | None = None) -> None:
     cfg = _load_config()
     if override:
         _ORG_OVERRIDE = override
-    args.fn(args, cfg)
+    started = time.monotonic()
+    exit_code = 0
+    try:
+        args.fn(args, cfg)
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        raise
+    except KeyboardInterrupt:
+        exit_code = 130
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        from .cli_analytics import track_command
+
+        track_command(command=args.fn.__name__.removeprefix("cmd_"), exit_code=exit_code,
+                      duration_ms=round((time.monotonic() - started) * 1000),
+                      base_url=cfg.get("base_url", PRODUCTION_BASE_URL), config_path=CONFIG_PATH)
 
 
 if __name__ == "__main__":

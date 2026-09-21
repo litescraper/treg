@@ -129,8 +129,11 @@ slash in `probe_path`), 200-with-error-body (read a body field), CSV/text respon
    `source.openapi: null`.
 2. **Select** ~8–15 endpoints; ALWAYS include ones matching capabilities other providers already
    implement (overlap enables comparison).
-3. **Map** each to a capability from `capabilities.yaml`; missing jobs go under
-   `proposed_capabilities:` in the provider file, not straight into the shared taxonomy.
+3. **Map** each to a capability from `capabilities.yaml`. Search the taxonomy AND the other
+   provider files for the job first; reuse an existing id, never a near-duplicate. Missing jobs go
+   under `proposed_capabilities:` in the provider file, not straight into the shared taxonomy —
+   and if another provider's endpoint already does the job unmapped, name it in the PR so the
+   reviewer attaches both to the new capability.
 4. **Describe** `input` (param names, types, required, location; constraints into `note`).
 5. **Cost** with full provenance: `type/value/currency/per/unit` + `source/source_url/checked/
    confidence`. Unknown price → `value: null` + `confidence: unknown` + a note. Prefer a
@@ -157,6 +160,24 @@ uv run --frozen python -m pytest -q
     cost `note` — never let the stamp imply the price was confirmed.
   - **A miss on a per_success route** (`{"phones":[]}`, 0 credits) proves miss=free, not the
     hit price. Say so in the note.
+- **Declare the miss shape, or the router turns every miss into a 502.** Probe each find/enrich
+  endpoint once with a person who cannot exist and record status, body, latency and charge. The
+  routed waterfall reads only the endpoint's `miss:` block: a 2xx is hit-or-miss by the adapter's
+  predicate, and any 4xx is an ERROR unless `miss: {status, means}` names it — one error child
+  and the parent cannot answer "miss", so eight clean misses plus one undeclared 404 is a 502
+  (#573: 64% of three days of `treg.people.email.find` 502s were exactly this).
+  - LimaData answered 404 for "no email"; the cost `note` said "a 404 miss is free" but no
+    `miss:` block existed. Prose in `note` is documentation; only the `miss:` block is read.
+  - Prospeo answers 400 for BOTH `NO_MATCH` (a miss) and `INVALID_DATAPOINTS` (a real error). When
+    status alone cannot separate them the declaration needs a body predicate, not a
+    `provider == "x"` branch in `route.py` — provider knowledge lives in YAML and adapters only.
+  - The hit-only `example_response` hides the miss shape from every later reader; capture the
+    miss body too (scrubbed) or describe it in `means`.
+  - Record the miss-path latency. A provider whose miss is slow (LimaData 404: median 10 s) sits
+    late in the ladder or under a tighter child timeout, or a nine-child waterfall blows the
+    caller's client timeout.
+  - Test the miss under the ROUTED parent (`treg.<capability>`), not only the direct `/call/`;
+    the direct call looked fine for both providers.
 - **Settle ≤ reserve only on evidence.** If the code settles a modal price below its reserve
   (e.g. drops a documented per-result rider because one 1-row probe didn't charge it), that is an
   unproven assumption that under-bills treg on every call (#141 inverse). Settle at the estimate
@@ -242,6 +263,9 @@ under the real charge (#141, GitHub→LinkedIn: claimed 1 credit, metered 5). Th
   anywhere
 - Every endpoint carries `verified:` + example backed by a real target and an observed charge, or
   its cost `note` states exactly what was not observed (hit price / rider / placeholder)
+- Every find/enrich endpoint with a routing adapter has its miss shape observed and, when the
+  miss is a 4xx, declared in `miss:`; the ledger row for the deliberate-miss probe shows the
+  status, body and latency
 - Platform-key slot shipped: `config.py` setting, `render.yaml` key (no value), `fx.yaml` rate
   from a real top-up, `platform_eligible` test for the whole file; env value handed to Jason
   out-of-band with the `TREG_PLATFORM_PROVIDERS` entry. Enabling in Render is his call, not

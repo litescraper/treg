@@ -380,6 +380,7 @@ async def _pm_and_fingerprint(pi_id: str) -> tuple[str | None, str | None]:
 # ---- manual top-up (Stripe-hosted Checkout) ----------------------------------------------------
 async def create_topup_checkout(
     db: AsyncSession, org: Org, amount_usd, *, return_base: str = "", email: str = "",
+    entry_surface: str = "", checkout_source: str = "",
 ) -> dict:
     """Start a hosted Checkout for a one-off top-up and return `{url, session_id, amount_micro}`.
 
@@ -409,6 +410,8 @@ async def create_topup_checkout(
     Currency is pinned to USD explicitly — the Stripe account's own default is AUD, and inheriting it
     would charge a number the ledger would then credit as dollars.
     """
+    attribution = {"entry_surface": analytics.funnel_surface(entry_surface),
+                   "checkout_source": analytics.funnel_surface(checkout_source)}
     amount = validate_topup_usd(amount_usd)
     amount_micro = usd_to_micro(amount)
     customer = await get_or_create_customer(db, org, email=email)
@@ -435,7 +438,7 @@ async def create_topup_checkout(
             # the webhook may arrive as `payment_intent.succeeded`, which carries the PI's metadata and
             # not the session's — the credit path must work from either event.
             "setup_future_usage": "off_session",
-            "metadata": {"treg_org_id": str(org.id), "treg_kind": "topup", "treg_auto": "0"},
+            "metadata": {"treg_org_id": str(org.id), "treg_kind": "topup", "treg_auto": "0", **attribution},
             **({"receipt_email": email} if email else {}),
         },
         # The expensable document (see docstring). `invoice_data` carries the same org identity as the
@@ -457,7 +460,7 @@ async def create_topup_checkout(
         allow_promotion_codes=True,
         # Idempotent per (org, amount, minute): a double-clicked "Add funds" reuses the same session
         # instead of opening a second one the payer might also complete.
-        metadata={"treg_org_id": str(org.id), "treg_kind": "topup"},
+        metadata={"treg_org_id": str(org.id), "treg_kind": "topup", **attribution},
         integration_identifier=INTEGRATION_ID,
         success_url=f"{base}/app?topup=success#billing",
         cancel_url=f"{base}/app?topup=cancelled#billing",
@@ -522,22 +525,18 @@ async def create_portal_session(db: AsyncSession, org: Org, *, return_base: str 
 
 
 # ---- payment history ---------------------------------------------------------------------------
-async def list_payments(db: AsyncSession, org: Org, *, limit: int = 24) -> dict:
-    """The org's completed top-ups, newest first, each with a link to its invoice or receipt.
+# Split in two so the DB session (see `get_payment_history`) can close before the Stripe round trip in
+# `_payment_documents` — a pooled connection must never sit open across an upstream call, the same
+# lesson the 2026-08-24 `/call/` deadlock taught (`infra/db.py`).
+async def _load_payment_rows(
+    db: AsyncSession, org: Org, *, limit: int = 24,
+) -> tuple[list[CreditBlock], set[str], dict[str, int]]:
+    """The org's completed top-ups, newest first: DB rows, their auto-topup flags, bonus amounts.
 
     The ROWS come from our own `CreditBlock` table, not from Stripe. That table is what the balance is
     computed from, so a history built on it can never show a payment the balance disagrees with — and
-    it needs no network call to render amounts and dates.
-
-    Stripe is asked only for the DOCUMENTS, in two list calls rather than two per row: charges (which
-    carry `receipt_url` and point at the invoice) and invoices (which carry the PDF). A failure there
-    degrades to rows without links — a Stripe hiccup should cost the payer their download button, not
-    their payment history. `stripe_ok` says which happened so the UI can tell them.
-
-    Both Stripe windows cap at 100 payments, so a very old top-up on a heavily-used account can come
-    back link-less; the portal (`create_portal_session`) is the unbounded archive.
-
-    Read-only: nothing here moves money or writes to the ledger.
+    it needs no network call to render amounts and dates. Read-only: nothing here moves money or
+    writes to the ledger.
     """
     blocks = (await db.execute(
         select(CreditBlock)
@@ -572,7 +571,14 @@ async def list_payments(db: AsyncSession, org: Org, *, limit: int = 24) -> dict:
             if isinstance(meta, dict) and meta.get("source") == "topup_bonus" and meta.get("payment_intent"):
                 bonus_by_pi[str(meta["payment_intent"])] = bonus_by_pi.get(str(meta["payment_intent"]), 0) + int(amt)
 
-    docs, stripe_ok = await _payment_documents(org, len(blocks))
+    return list(blocks), auto, bonus_by_pi
+
+
+def _assemble_payments(
+    blocks: list[CreditBlock], auto: set[str], bonus_by_pi: dict[str, int],
+    docs: dict[str, dict], stripe_ok: bool,
+) -> dict:
+    """Join DB rows with Stripe documents. Pure — no I/O, safe to call after the session is closed."""
     items = []
     for b in blocks:
         d = docs.get(b.stripe_payment_intent or "", {})
@@ -594,8 +600,10 @@ async def list_payments(db: AsyncSession, org: Org, *, limit: int = 24) -> dict:
 async def _payment_documents(org: Org, wanted: int) -> tuple[dict[str, dict], bool]:
     """`{payment_intent_id: {receipt_url, number, invoice_pdf, hosted_invoice_url}}` for one customer.
 
-    Two list calls, joined in memory through the charge's `invoice` field. Returns `({}, False)` on
-    any Stripe failure — the caller renders amounts without links rather than a 500.
+    Two list calls (charges, invoices) rather than two per row, joined in memory through the charge's
+    `invoice` field. Both windows cap at 100 payments, so a very old top-up on a heavily-used account
+    can come back link-less; the portal (`create_portal_session`) is the unbounded archive. Returns
+    `({}, False)` on any Stripe failure — the caller renders amounts without links rather than a 500.
     """
     if not (org.stripe_customer_id and wanted and configured()):
         return {}, bool(configured())
@@ -906,7 +914,7 @@ async def handle_webhook_event(db: AsyncSession, event: dict) -> dict:
 
 
 async def _credit(db: AsyncSession, org_id: int, amount_micro: int, pi_id: str, *, auto: bool,
-                  fingerprint: str | None = None) -> dict:
+                  fingerprint: str | None = None, attribution: dict | None = None) -> dict:
     """Credit a paid PaymentIntent to the org's balance, once. Emails a receipt only when this
     delivery is the one that actually moved money — a redelivery must not re-notify.
 
@@ -916,11 +924,13 @@ async def _credit(db: AsyncSession, org_id: int, amount_micro: int, pi_id: str, 
     # "Has this PaymentIntent already been credited?" is asked BEFORE the credit rather than inferred
     # from a balance change afterwards — a concurrent reserve moves the balance too, and mistaking that
     # for a fresh credit would email a receipt on every webhook redelivery.
+    attribution = {key: analytics.funnel_surface((attribution or {}).get(key, ""))
+                   for key in ("entry_surface", "checkout_source")}
     already = (await db.execute(
         select(CreditBlock.id).where(CreditBlock.stripe_payment_intent == pi_id)
     )).first() is not None
     block = await ledger.topup(db, org_id, amount_micro, pi_id,
-                              meta={"auto": auto, "source": "stripe"})
+                              meta={"auto": auto, "source": "stripe", **attribution})
     block_id = block.id  # captured now: a later rollback (the ad-conversion except below) expires
                         # every object this session is tracking, `block` included, and reading an
                         # expired attribute outside an awaited call raises MissingGreenlet.
@@ -965,7 +975,7 @@ async def _credit(db: AsyncSession, org_id: int, amount_micro: int, pi_id: str, 
         # the `team` group is what makes org-level revenue exact. capture() never raises — an
         # exception here would 500 the webhook and make Stripe retry an already-credited payment.
         analytics.capture(to or f"org:{org_id}", "topup_completed",
-                          {"amount_micro": amount_micro,
+                          {**attribution, "amount_micro": amount_micro,
                            "amount_usd": amount_micro / 1_000_000,  # display-only, never computed against
                            "auto": auto, "balance_after_micro": after,
                            "bonus_micro": bonus_micro, "bonus_pct": bonus_pct,
@@ -1048,7 +1058,8 @@ async def _on_checkout_completed(db: AsyncSession, session: dict) -> dict:
     # the abuse gate that stops one card claiming a bounty under a second email. Same single retrieve
     # that already ran here for the saved-card id, just moved above the credit.
     pm_id, fingerprint = await _pm_and_fingerprint(pi_id)
-    result = await _credit(db, org_id, amount_micro, pi_id, auto=False, fingerprint=fingerprint)
+    result = await _credit(db, org_id, amount_micro, pi_id, auto=False, fingerprint=fingerprint,
+                           attribution=session.get("metadata") or {})
     # The Checkout saved the card (setup_future_usage); remember it so auto-top-up can be armed
     # without asking for a second card entry.
     await _set_default_pm(db, org_id, pm_id)
@@ -1068,7 +1079,7 @@ async def _on_payment_succeeded(db: AsyncSession, pi: dict) -> dict:
     amount_micro = cents_to_micro(pi.get("amount_received") or pi.get("amount") or 0)
     if amount_micro <= 0:
         return {"handled": False, "reason": "zero amount"}
-    result = await _credit(db, org_id, amount_micro, pi["id"], auto=meta.get("treg_auto") == "1")
+    result = await _credit(db, org_id, amount_micro, pi["id"], auto=meta.get("treg_auto") == "1", attribution=meta)
     pm = pi.get("payment_method")
     await _set_default_pm(db, org_id, pm if isinstance(pm, str) else (pm or {}).get("id"))
     return result
@@ -1254,13 +1265,15 @@ async def get_billing_state(org_id: int) -> dict:
 
 async def start_topup(
     org_id: int, amount_usd: float | None, *, return_base: str, email: str,
+    entry_surface: str = "", checkout_source: str = "",
 ) -> dict:
     async with _db.session_maker() as db:
         org = await _journey_org(db, org_id)
         amount = amount_usd if amount_usd is not None else await next_default_usd(db, org.id)
         try:
             out = await create_topup_checkout(
-                db, org, amount, return_base=return_base, email=email)
+                db, org, amount, return_base=return_base, email=email,
+                entry_surface=entry_surface, checkout_source=checkout_source)
         except BillingNotConfigured as e:
             raise BillingJourneyError("not_configured", str(e)) from e
         except TopupRejected as e:
@@ -1268,7 +1281,9 @@ async def start_topup(
         # The one place the actual payer's identity exists — the webhook that later credits the
         # balance is org-scoped, so the started/completed funnel joins on the team group.
         analytics.capture(email, "topup_started",
-                          {"amount_usd": amount, "org": org.slug},
+                          {"amount_usd": amount, "org": org.slug,
+                           "entry_surface": analytics.funnel_surface(entry_surface),
+                           "checkout_source": analytics.funnel_surface(checkout_source)},
                           groups={"team": org.slug})
         return out
 
@@ -1303,9 +1318,13 @@ async def configure_autotopup(
 
 
 async def get_payment_history(org_id: int, *, limit: int) -> dict:
+    # The DB session closes before `_payment_documents` calls Stripe below — a pooled connection must
+    # never sit open across an upstream round trip (the 2026-08-24 `/call/` deadlock, `infra/db.py`).
     async with _db.session_maker() as db:
         org = await _journey_org(db, org_id)
-        return await list_payments(db, org, limit=limit)
+        blocks, auto, bonus_by_pi = await _load_payment_rows(db, org, limit=limit)
+    docs, stripe_ok = await _payment_documents(org, len(blocks))
+    return _assemble_payments(blocks, auto, bonus_by_pi, docs, stripe_ok)
 
 
 async def open_billing_portal(org_id: int, *, return_base: str) -> dict:
